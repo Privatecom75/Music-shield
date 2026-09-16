@@ -76,6 +76,25 @@ def _cmd_audibility(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_ai_metrics(args: argparse.Namespace) -> int:
+    from music_shield import ai_eval
+
+    pipelines = [p.strip() for p in args.pipelines.split(",") if p.strip()]
+    for p in pipelines:
+        if p not in ai_eval.PIPELINES:
+            print(f"error: unknown pipeline '{p}'. Choose from {', '.join(ai_eval.PIPELINES)}", file=sys.stderr)
+            return 1
+        if p.startswith("encodec") and not ai_eval.encodec_available():
+            print("error: the EnCodec pipelines need `pip install torch encodec` (CPU wheel is fine).", file=sys.stderr)
+            return 1
+    reports, table = ai_eval.run_report(args.clip, presets=args.presets or None, pipelines=pipelines, seed=args.seed)
+    if args.json:
+        print(json.dumps([r.as_dict() for r in reports], indent=2))
+    else:
+        print(table)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="music_shield",
@@ -126,6 +145,17 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--seed", type=int, default=1234)
     a.add_argument("--json", action="store_true")
     a.set_defaults(func=_cmd_audibility)
+
+    ai = sub.add_parser(
+        "ai-metrics",
+        help="Change remaining through free local copy/ML pipelines (MP3+denoise, 16 kHz resample, EnCodec). Not efficacy.",
+    )
+    ai.add_argument("--clip", default="busy", help=f"One of {', '.join(BUILTIN_CLIPS)} (synthetic) or a path to a WAV/FLAC you own")
+    ai.add_argument("--presets", nargs="*", choices=list(PRESETS))
+    ai.add_argument("--pipelines", default="mp3-denoise,resample16k,encodec-6k,encodec-24k", help="Comma-separated pipeline names")
+    ai.add_argument("--seed", type=int, default=1234)
+    ai.add_argument("--json", action="store_true")
+    ai.set_defaults(func=_cmd_ai_metrics)
     return parser
 
 
