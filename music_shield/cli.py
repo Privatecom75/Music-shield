@@ -63,6 +63,19 @@ def _cmd_codec_metrics(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_audibility(args: argparse.Namespace) -> int:
+    from music_shield.audibility import evaluate_presets, markdown_table as audibility_table
+    from music_shield.codec_eval import load_clip
+
+    audio, sr = load_clip(args.clip)
+    reports = evaluate_presets(audio, sr, presets=args.presets or None, seed=args.seed)
+    if args.json:
+        print(json.dumps([r.as_dict() for r in reports], indent=2))
+    else:
+        print(audibility_table(reports, args.clip))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="music_shield",
@@ -103,6 +116,16 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--seed", type=int, default=1234)
     m.add_argument("--json", action="store_true", help="Print full JSON instead of a markdown table")
     m.set_defaults(func=_cmd_codec_metrics)
+
+    a = sub.add_parser(
+        "audibility",
+        help="Objective audibility proxies (segmental SNR, noise-to-mask ratio, band residuals). Not a listening test.",
+    )
+    a.add_argument("--clip", default="busy", help=f"One of {', '.join(BUILTIN_CLIPS)} (synthetic) or a path to a WAV/FLAC you own")
+    a.add_argument("--presets", nargs="*", choices=list(PRESETS))
+    a.add_argument("--seed", type=int, default=1234)
+    a.add_argument("--json", action="store_true")
+    a.set_defaults(func=_cmd_audibility)
     return parser
 
 

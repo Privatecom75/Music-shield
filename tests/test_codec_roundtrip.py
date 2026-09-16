@@ -110,7 +110,7 @@ def test_high_band_only_perturbation_is_removed_by_mp3(busy, monkeypatch):
     128 kbps, so its retained fraction should collapse. This is the behaviour
     that motivated moving the presets' weight onto jitter and phase drift.
     """
-    hf_only = replace(perturb.PRESETS["light"], name="hf_only", noise_offset_db=-200.0, jitter_db=0.0, phase_deg=0.0, hf_level_db=-40.0)
+    hf_only = replace(perturb.PRESETS["light"], name="hf_only", noise_offset_db=-200.0, jitter_db=0.0, phase_deg=0.0, hf_offset_db=0.0)
     monkeypatch.setitem(perturb.PRESETS, "hf_only", hf_only)
     report = evaluate_roundtrip(busy, SR, "hf_only", "mp3", 128, seed=1234)
     assert report.retained_fraction < 0.5
@@ -125,7 +125,7 @@ def test_modulation_is_shared_across_channels(demo):
     """
     mono = demo[:, :1]
     dual = np.concatenate([mono, mono], axis=1)
-    quiet = replace(perturb.PRESETS["light"], name="mod_only", noise_offset_db=-200.0, hf_level_db=-200.0)
+    quiet = replace(perturb.PRESETS["light"], name="mod_only", noise_offset_db=-200.0, hf_offset_db=-200.0)
     perturb.PRESETS["mod_only"] = quiet
     try:
         out, _ = perturb.protect(dual, SR, "mod_only", seed=3)
