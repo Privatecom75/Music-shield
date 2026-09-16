@@ -97,8 +97,8 @@ PRESETS: dict[str, Preset] = {
         label="Medium",
         description="More change to the spectrogram. May be faintly audible on quiet, sparse passages.",
         noise_offset_db=-8.0,
-        jitter_db=1.1,
-        phase_deg=6.0,
+        jitter_db=1.0,
+        phase_deg=5.0,
         hf_level_db=-48.0,
         jitter_smooth_s=0.5,
     ),
@@ -215,11 +215,17 @@ def _masking_curve(power: np.ndarray, edges: np.ndarray, band_of_bin: np.ndarray
 
 
 def _smooth_walk(rng: np.random.Generator, n_frames: int, smooth_frames: int, n_series: int) -> np.ndarray:
-    """Smoothed Gaussian noise per series, normalised to roughly unit std."""
-    raw = rng.standard_normal((n_series, n_frames + 2 * smooth_frames))
-    kernel = np.ones(max(1, smooth_frames)) / max(1, smooth_frames)
+    """Smoothed Gaussian noise per series, normalised to roughly unit std.
+
+    A Hann kernel (rather than a boxcar) keeps the walk's derivative smooth,
+    so the modulation has no fast, tremolo-like components.
+    """
+    width = max(2, 2 * smooth_frames)
+    raw = rng.standard_normal((n_series, n_frames + 2 * width))
+    kernel = np.hanning(width + 2)[1:-1]
+    kernel /= kernel.sum()
     smoothed = np.stack([np.convolve(r, kernel, mode="same") for r in raw])
-    smoothed = smoothed[:, smooth_frames : smooth_frames + n_frames]
+    smoothed = smoothed[:, width : width + n_frames]
     std = smoothed.std(axis=1, keepdims=True)
     std[std < 1e-9] = 1.0
     return smoothed / std
