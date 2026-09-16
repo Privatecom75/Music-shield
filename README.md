@@ -5,8 +5,9 @@ with a light, psychoacoustically-shaped perturbation → download it. The
 perturbation is designed to be hard to hear on normal playback while altering
 the spectrogram-level features that audio ML models consume.
 
-**Run locally:** `./run.sh` then open http://127.0.0.1:8420. Local only — this
-is not deployed anywhere. **Honest limits:** read [LIMITS.md](LIMITS.md).
+**Run locally:** `./run.sh` then open http://127.0.0.1:8420. A hosted
+instance, if you run one, should sit behind the built-in HTTP Basic auth (see
+[DEPLOY.md](DEPLOY.md)). **Honest limits:** read [LIMITS.md](LIMITS.md).
 
 **This is friction, not protection.** It is not DRM, not AI-proof, and not a
 proof of ownership. Re-encoding, denoising, remixing, resampling, or an
@@ -26,8 +27,8 @@ mixes them into a lossless output:
 | --- | --- | --- |
 | Spectral jitter | A slowly drifting gain wobble on ~34 knots over a warped frequency scale, interpolated smoothly across bins (a time-varying micro-EQ, ±0.6 dB peak at the default preset) | Multiplicative on the track's own content, so codecs that reproduce the music also reproduce the wobble; the only component that moves magnitude spectrograms |
 | Phase drift | A slow per-knot rotation of the STFT phase (a time-varying all-pass, ±3° peak at the default preset), identical on all channels | Hearing is nearly insensitive to slow monaural phase changes, codecs pass it through, and the stereo image does not move. Changes the waveform and complex spectrum; leaves magnitude spectrograms essentially untouched |
-| Masked noise | Pseudo-random noise whose per-bin level sits under a simplified masking curve computed from the track's own band energies | Hides behind loud content instead of sounding like flat hiss; changes fine spectral detail. Kept small at `light` because codecs largely replace it with their own noise |
-| High-band component | Very low-level energy above 15 kHz, following the track's loudness envelope, only when the sample rate allows | Cheap extra change in a region most adults barely hear. Removed by every common lossy encoder's low-pass, so it is no longer relied on |
+| Masked noise | Pseudo-random noise whose per-bin level sits under a simplified masking curve computed from the track's own band energies (asymmetric neighbour spreading, backward running-minimum so noise never precedes an attack) | Hides behind loud content instead of sounding like flat hiss; changes fine spectral detail. Kept small at `light`: codecs replace it with their own noise, neural codecs barely see it, and it is the only hiss risk |
+| High-band component | A little extra masked noise above 15 kHz at a smaller offset under the same masking curve, only where the track already has content there and the sample rate allows | Cheap extra change in a region most adults barely hear. Removed by every common lossy encoder's low-pass, so nothing relies on it; a track with no air band gets nothing added |
 
 Digital silence stays silent. If the result would clip, the whole file is
 scaled down rather than hard-clipped, and the UI tells you.
@@ -37,16 +38,24 @@ returned "change level (SNR)" number describes how much the file changed —
 higher means smaller change. It says nothing about how well the file is
 protected; nobody can honestly give you that number and this tool does not try.
 
-How much of the change survives an MP3/AAC re-encode is measured, on synthetic
-clips only, in [METRICS.md](METRICS.md). Short version: at MP3 128 kbps about
-94 % of the `light` change is still in the decoded file, but the codec's own
-error is louder than our perturbation. Those are *change remaining* numbers,
-not protection efficacy.
+What we measured, on synthetic clips only, is in [METRICS.md](METRICS.md):
 
-What it deliberately does **not** do in v1: model-targeted adversarial
-optimisation (no gradient attacks against specific models), and audio
-watermarking / ownership verification. Both are deferred — see
-[Roadmap](#roadmap-not-promises).
+- **Audibility** (objective proxies, no human panel): `light` passes fixed
+  thresholds on dense and mixed material; steady tonal material may expose
+  the gain wobble; quiet sparse solo material is flagged at every preset.
+- **Copy friction** against free local pipelines (MP3+denoise, 16 kHz
+  resample, Meta's open EnCodec neural codec): 91–103 % of the change
+  survives all of them, but every pipeline's own error is louder than our
+  perturbation, and `light` moves EnCodec's tokens and latents *less than an
+  ordinary MP3 does*. For codec-token models the honest summary is "barely
+  matters".
+- **Codec survival**: at MP3 128 kbps about 95 % of the `light` change is
+  still in the decoded file, buried under codec error that is louder.
+
+These are *change remaining* and *representation shift* numbers, not
+protection efficacy. What it deliberately does **not** do: model-targeted
+adversarial optimisation, and audio watermarking / ownership verification.
+See [Roadmap](#roadmap-not-promises).
 
 ## Run locally
 
@@ -110,7 +119,17 @@ python -m music_shield presets
 # measure how much change remains after an MP3 / AAC round-trip (needs ffmpeg)
 python -m music_shield codec-metrics                          # synthetic "busy" clip, all presets, 192k + 128k
 python -m music_shield codec-metrics --clip my-track.wav --presets light --codecs mp3,aac --json
+
+# objective audibility proxies (segmental SNR, noise-to-mask ratio, band residuals); not a listening test
+python -m music_shield audibility --clip sparse
+python -m music_shield audibility --clip my-track.wav --presets light
+
+# change remaining through free copy / ML pipelines; EnCodec rows need `pip install torch encodec`
+python -m music_shield ai-metrics --clip busy
+python -m music_shield ai-metrics --clip my-track.wav --pipelines mp3-denoise,resample16k
 ```
+
+Built-in synthetic clips: `busy`, `demo`, `sparse`, `sustained`, `tone`.
 
 ## Tests
 
@@ -130,7 +149,12 @@ re-encodes protected and unprotected clips to MP3 at 192k and 128k, decodes
 them, and asserts that the difference is still there above a documented floor,
 that the `light` SNR stays conservative, that nothing clips or goes NaN, that
 jitter/phase are shared across channels, and — as a negative control — that a
->15 kHz-only perturbation is removed by the codec. Floors are listed in
+>15 kHz-only perturbation is removed by the codec.
+`tests/test_audibility.py` asserts the `light` proxy floors on the dense clip,
+that presets get monotonically more audible, that no high band is added to a
+track that has none, and that no noise precedes an attack from silence.
+`tests/test_ai_eval.py` asserts the change survives the denoise and resample
+chains (EnCodec test skipped without torch/encodec). Floors are listed in
 [METRICS.md](METRICS.md).
 
 ## API
@@ -143,32 +167,41 @@ jitter/phase are shared across channels, and — as a negative control — that 
 | `GET` | `/api/download/{job_id}` | The protected file (`audio/wav` or `audio/flac`) |
 | `GET` | `/api/health` | Liveness |
 
-No authentication. This is a local MVP; if you host it anywhere shared, put it
-behind a login or a reverse proxy with basic auth (see [DEPLOY.md](DEPLOY.md)).
+Authentication: when `MUSIC_SHIELD_BASIC_PASSWORD` is set (optionally with
+`MUSIC_SHIELD_BASIC_USER`), every request requires HTTP Basic auth with that
+single shared credential. Unset, the app is open, which is only acceptable on
+`127.0.0.1`. See [DEPLOY.md](DEPLOY.md). Never commit the password.
 
 ## Project layout
 
 ```
 music_shield/      engine (perturb.py), codec round-trip metrics (codec_eval.py),
-                   audio I/O, synthetic signals, CLI
+                   audibility proxies (audibility.py), copy-friction pipelines
+                   (ai_eval.py), audio I/O, synthetic signals, CLI
 app/main.py        FastAPI server
 app/static/        plain HTML / CSS / JS front end
 tests/             pytest suite
 LIMITS.md          honest failure modes
-METRICS.md         what survives an MP3/AAC re-encode, and how it was measured
+METRICS.md         audibility proxies, copy-friction pipelines, codec survival; how measured
 DEPLOY.md          $0 / cheap hosting notes (no automation)
 ```
 
 ## Roadmap (not promises)
 
-- Listening tests on real material to tune the presets — the current values
-  are based on SNR, construction arguments and a handful of synthetic
-  signals, not on human trials.
-- Run `codec-metrics` on real, licensed material rather than synthetic clips.
-- Evaluate against actual open-source audio models and publish whatever we
-  find, including if the answer is "it barely matters".
-- Optional watermark for ownership marking (deferred from v1; verification was
-  not built).
+- Done in this version: objective audibility proxies on four synthetic clips
+  (no human panel), evaluation against a free open model (EnCodec) and two
+  ffmpeg pipelines with the finding published as-is ("barely matters" for
+  codec-token models), and a preset retune from both.
+- Still open: **human listening tests** on real, licensed material. The
+  proxies flag sparse solo material at every preset and steady tonal material
+  at `light`; only ears can settle those.
+- Run `codec-metrics`, `audibility` and `ai-metrics` on real, licensed
+  material rather than synthetic clips.
+- Optional watermark for ownership marking. Not built: given that the
+  perturbation itself barely registers on a neural codec, a light verification
+  stub would invite exactly the false confidence this project refuses to
+  sell, and it would need its own robustness study first. No strip tools,
+  ever.
 - Model-targeted perturbations (research, not v1).
 
 ## License and intent

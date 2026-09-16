@@ -25,11 +25,12 @@ Four components are combined:
    regions can hide more noise than quiet ones, so the noise "follows" the
    music instead of being a flat hiss. Lossy codecs replace much of this with
    their own quantisation noise; it is kept small at `light`.
-4. High-band perturbation — extra energy in the mostly-inaudible top of the
-   spectrum (above ~15 kHz) when the sample rate allows. Cheap friction that
-   some feature extractors still see, but it is removed by the low-pass
-   filter in every common lossy encoder, so it is now kept very low and is
-   not counted on for anything after a re-encode.
+4. High-band component — extra masked noise above ~15 kHz, at a smaller
+   offset under the masking curve, when the sample rate allows. Cheap
+   friction that some feature extractors still see, but it is removed by the
+   low-pass filter in every common lossy encoder and is not counted on for
+   anything after a re-encode. Because it is mask-shaped, a track with no
+   content above 15 kHz gets nothing added there.
 
 The masking model here is deliberately simple (band energies, a fixed offset,
 neighbour spreading). It is not an MPEG psychoacoustic model and it makes no
@@ -49,6 +50,16 @@ PEAK_CEILING = 0.995
 ABSOLUTE_FLOOR_DB = -85.0
 NUM_BANDS = 32
 HF_BAND_START_HZ = 15_000.0
+# Masking spread into neighbouring bands. Bands are ~0.27 octave (0.6 Bark at
+# 300 Hz, 1-2 Bark in the mids). Real masking slopes are roughly -25 dB/Bark
+# upward and steeper downward, so these are still on the generous side. Both
+# were -10 dB, which put noise into empty bands next to loud ones at a level
+# the audibility proxies flagged on sparse material.
+NEIGHBOUR_SPREAD_UP_DB = -18.0
+NEIGHBOUR_SPREAD_DOWN_DB = -27.0
+# Frames of backward running-minimum applied to the masking curve so noise
+# cannot precede an attack (3 hops = the earlier frames overlapping a window).
+PRE_ECHO_FRAMES = 3
 
 # Jitter / phase knots: at least this far apart in Hz at the bottom of the
 # spectrum (wider than the STFT main lobe, so one low partial is not split
@@ -75,8 +86,9 @@ class Preset:
     jitter_db: float
     # Peak size of the phase drift, in degrees (reached at 2 sigma).
     phase_deg: float
-    # Level of the high-band component relative to the track RMS, in dB.
-    hf_level_db: float
+    # The >15 kHz component sits this many dB below the masking curve (a
+    # smaller offset than the main noise: hearing is poor up there).
+    hf_offset_db: float
     # Smoothing window for the jitter / phase random walks, in seconds.
     jitter_smooth_s: float
 
@@ -89,27 +101,27 @@ PRESETS: dict[str, Preset] = {
         noise_offset_db=-14.0,
         jitter_db=0.6,
         phase_deg=3.0,
-        hf_level_db=-56.0,
+        hf_offset_db=-10.0,
         jitter_smooth_s=0.8,
     ),
     "medium": Preset(
         name="medium",
         label="Medium",
-        description="More change to the spectrogram. May be faintly audible on quiet, sparse passages.",
-        noise_offset_db=-8.0,
-        jitter_db=1.0,
-        phase_deg=5.0,
-        hf_level_db=-48.0,
+        description="More change to the spectrogram. May be faintly audible as a slow EQ wobble on sustained or sparse passages.",
+        noise_offset_db=-12.0,
+        jitter_db=1.3,
+        phase_deg=8.0,
+        hf_offset_db=-8.0,
         jitter_smooth_s=0.5,
     ),
     "strong": Preset(
         name="strong",
         label="Strong",
         description="Trades listening quality for more disruption. Expect audible texture on headphones.",
-        noise_offset_db=-4.0,
-        jitter_db=1.8,
-        phase_deg=10.0,
-        hf_level_db=-40.0,
+        noise_offset_db=-8.0,
+        jitter_db=2.2,
+        phase_deg=14.0,
+        hf_offset_db=-4.0,
         jitter_smooth_s=0.3,
     ),
 }
@@ -192,11 +204,13 @@ def _bin_to_band(edges: np.ndarray, n_bins: int) -> np.ndarray:
     return band_of_bin
 
 
-def _masking_curve(power: np.ndarray, edges: np.ndarray, band_of_bin: np.ndarray) -> np.ndarray:
+def _masking_curve(power: np.ndarray, edges: np.ndarray, band_of_bin: np.ndarray, pre_echo_frames: int = PRE_ECHO_FRAMES) -> np.ndarray:
     """Estimate a per-bin masking power from the signal's own band energies.
 
-    Simplified model: mean band power, spread to neighbours at -10 dB, offset
+    Simplified model: mean band power, spread to neighbours (-18 dB upward, -27 dB downward), offset
     by -20 dB, then floored at an absolute threshold. Returned as *power*.
+    `pre_echo_frames=0` gives the instantaneous estimate (used by the
+    audibility proxies); the default applies the synthesis-side pre-echo limit.
     """
     n_bins, n_frames = power.shape
     band_power = np.zeros((NUM_BANDS, n_frames))
@@ -205,13 +219,20 @@ def _masking_curve(power: np.ndarray, edges: np.ndarray, band_of_bin: np.ndarray
         if hi > lo:
             band_power[b] = power[lo:hi].mean(axis=0)
     spread = band_power.copy()
-    neighbour_gain = 10 ** (-10 / 10)
-    spread[1:] = np.maximum(spread[1:], band_power[:-1] * neighbour_gain)
-    spread[:-1] = np.maximum(spread[:-1], band_power[1:] * neighbour_gain)
+    # Masking spreads upward in frequency more than downward.
+    spread[1:] = np.maximum(spread[1:], band_power[:-1] * 10 ** (NEIGHBOUR_SPREAD_UP_DB / 10))
+    spread[:-1] = np.maximum(spread[:-1], band_power[1:] * 10 ** (NEIGHBOUR_SPREAD_DOWN_DB / 10))
     masked = spread * 10 ** (-20 / 10)
+    # Pre-echo control: a frame's noise is synthesised over its whole window,
+    # so an attack near the end of the window would otherwise get noise
+    # ~40 ms *before* it, in the quiet, where backward masking cannot hide it.
+    # Limit each frame's mask by the earlier frames that overlap its span.
+    limited = masked.copy()
+    for k in range(1, pre_echo_frames + 1):
+        limited[:, k:] = np.minimum(limited[:, k:], masked[:, :-k])
     floor = 10 ** (ABSOLUTE_FLOOR_DB / 10)
-    masked = np.maximum(masked, floor)
-    return masked[band_of_bin]
+    limited = np.maximum(limited, floor)
+    return limited[band_of_bin]
 
 
 def _smooth_walk(rng: np.random.Generator, n_frames: int, smooth_frames: int, n_series: int) -> np.ndarray:
@@ -315,26 +336,25 @@ def _perturb_channel(
 
     y = _istft(spec_mod + noise_spec, n)
 
-    # 4. High-band perturbation, only if the sample rate actually has room.
+    # 4. High-band component: extra masked noise above 15 kHz, at a smaller
+    # offset under the same masking estimate (hearing is poor up there). It
+    # used to be RMS-calibrated and ignored the mask, which put energy into
+    # empty air bands on sparse material; shaping it under the mask means the
+    # whole additive part of the perturbation sits under the mask estimate by
+    # construction, and a track with nothing above 15 kHz gets nothing added.
     hf_applied = False
     hf_start_bin = int(HF_BAND_START_HZ / (sample_rate / 2.0) * (n_bins - 1))
     if hf_start_bin < n_bins - 4:
-        hf_applied = True
-        frame_silent = silent.all(axis=0)
-        hf_spec = np.zeros_like(spec)
-        hf_phase = rng.uniform(0, 2 * math.pi, size=(n_bins - hf_start_bin, n_frames))
-        # Follow the track's own loudness so the component ducks in quiet parts.
-        envelope = np.sqrt(power.mean(axis=0))
-        envelope = envelope / (envelope.max() + 1e-12)
-        envelope[frame_silent] = 0.0
-        hf_spec[hf_start_bin:] = envelope[None, :] * np.exp(1j * hf_phase)
-        hf = _istft(hf_spec, n)
-        # Calibrate against the track's RMS so the preset level means the same
-        # thing regardless of sample rate or FFT size.
-        track_rms = math.sqrt(float(np.mean(x**2))) + 1e-12
-        hf_rms = math.sqrt(float(np.mean(hf**2))) + 1e-12
-        target_rms = track_rms * 10 ** (preset.hf_level_db / 20)
-        y = y + hf * (target_rms / hf_rms)
+        hf_power = mask_power[hf_start_bin:] * 10 ** (preset.hf_offset_db / 10)
+        hf_power[silent[hf_start_bin:]] = 0.0
+        # Only bins whose own content is above the absolute floor got noise,
+        # so the mask floor alone never creates a high band from nothing.
+        if hf_power.any():
+            hf_applied = True
+            hf_phase = rng.uniform(0, 2 * math.pi, size=hf_power.shape)
+            hf_spec = np.zeros_like(spec)
+            hf_spec[hf_start_bin:] = np.sqrt(hf_power) * np.exp(1j * hf_phase)
+            y = y + _istft(hf_spec, n)
 
     return y, hf_applied
 

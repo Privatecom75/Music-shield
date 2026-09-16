@@ -56,7 +56,13 @@ import numpy as np
 import soundfile as sf
 
 from music_shield.perturb import DEFAULT_PRESET, PRESETS, protect
-from music_shield.synth import generate_busy_clip, generate_demo_clip, generate_tone
+from music_shield.synth import (
+    generate_busy_clip,
+    generate_demo_clip,
+    generate_sparse_clip,
+    generate_sustained_clip,
+    generate_tone,
+)
 
 MEL_BANDS = 64
 MEL_FMAX_HZ = 15_000.0
@@ -323,7 +329,7 @@ def evaluate_roundtrip(
     )
 
 
-BUILTIN_CLIPS = ("busy", "demo", "tone")
+BUILTIN_CLIPS = ("busy", "demo", "sparse", "sustained", "tone")
 
 
 def load_clip(name_or_path: str, sample_rate: int = 44100) -> tuple[np.ndarray, int]:
@@ -332,6 +338,10 @@ def load_clip(name_or_path: str, sample_rate: int = 44100) -> tuple[np.ndarray, 
         return generate_busy_clip(sample_rate), sample_rate
     if name_or_path == "demo":
         return generate_demo_clip(sample_rate), sample_rate
+    if name_or_path == "sparse":
+        return generate_sparse_clip(sample_rate), sample_rate
+    if name_or_path == "sustained":
+        return generate_sustained_clip(sample_rate), sample_rate
     if name_or_path == "tone":
         return generate_tone(5.0, sample_rate), sample_rate
     data, sr = sf.read(name_or_path, dtype="float64", always_2d=True)

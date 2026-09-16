@@ -165,3 +165,63 @@ def generate_busy_clip(sample_rate: int = BUSY_SAMPLE_RATE, duration_s: float = 
     out[-fade:] *= ramp[::-1][:, None]
     out /= np.abs(out).max() + 1e-12
     return 0.8 * out
+
+
+SPARSE_DURATION_S = 8.0
+SUSTAINED_DURATION_S = 8.0
+
+
+def generate_sparse_clip(sample_rate: int = 44100, duration_s: float = SPARSE_DURATION_S) -> np.ndarray:
+    """Quiet solo plucked notes with gaps between them: the audibility risk case.
+
+    Peaks around -18 dBFS, one note at a time, near-silence between notes, no
+    pad or percussion. There is very little energy to hide a perturbation
+    under, so this is where masked noise and modulation are most exposed.
+    Entirely synthetic.
+    """
+    n = int(duration_s * sample_rate)
+    t = np.arange(n) / sample_rate
+    out = np.zeros((n, 2))
+    notes = (329.63, 392.0, 440.0, 523.25, 392.0, 293.66, 329.63)
+    for i, f in enumerate(notes):
+        start = int(i * 1.1 * sample_rate)
+        if start >= n:
+            break
+        seg_t = t[: n - start]
+        env = np.minimum(1.0, seg_t / 0.005) * np.exp(-seg_t * 2.2)
+        voice = np.sin(2 * np.pi * f * seg_t) + 0.3 * np.sin(2 * np.pi * 2 * f * seg_t) + 0.08 * np.sin(2 * np.pi * 3 * f * seg_t)
+        pan = 0.4 + 0.2 * (i % 2)
+        out[start:, 0] += voice * env * (1 - pan)
+        out[start:, 1] += voice * env * pan
+    fade = int(0.01 * sample_rate)
+    ramp = np.linspace(0, 1, fade)
+    out[:fade] *= ramp[:, None]
+    out[-fade:] *= ramp[::-1][:, None]
+    out /= np.abs(out).max() + 1e-12
+    return 0.125 * out
+
+
+def generate_sustained_clip(sample_rate: int = 44100, duration_s: float = SUSTAINED_DURATION_S) -> np.ndarray:
+    """Steady organ-like chord over an exposed sustained sub-bass, no transients.
+
+    Steady tones are where a slow gain wobble or phase drift has nothing to
+    hide behind in time; the 41 Hz sub-bass sits right at the phase fade-in.
+    Entirely synthetic.
+    """
+    n = int(duration_s * sample_rate)
+    t = np.arange(n) / sample_rate
+    out = np.zeros((n, 2))
+    for i, f in enumerate((164.81, 246.94, 329.63, 493.88)):
+        voice = sum(np.sin(2 * np.pi * f * k * t) / (k * k) for k in (1, 2, 3, 4, 6))
+        pan = 0.3 + 0.4 * (i / 3)
+        out[:, 0] += voice * (1 - pan) / (i + 1.5)
+        out[:, 1] += voice * pan / (i + 1.5)
+    out += (0.5 * np.sin(2 * np.pi * 41.2 * t))[:, None]
+    swell = 0.7 + 0.3 * np.sin(2 * np.pi * 0.15 * t - np.pi / 2)
+    out *= swell[:, None]
+    fade = int(0.05 * sample_rate)
+    ramp = np.linspace(0, 1, fade)
+    out[:fade] *= ramp[:, None]
+    out[-fade:] *= ramp[::-1][:, None]
+    out /= np.abs(out).max() + 1e-12
+    return 0.5 * out
