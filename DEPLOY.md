@@ -3,8 +3,10 @@
 **Jab approved go-live (via Big Boss) for free-tier only — keep basic auth on.**
 
 These are notes, not automation. Nothing in this repo deploys anywhere on its
-own. Before hosting a shared instance, remember the app has **no auth**: put
-it behind basic auth, a login page, or keep it private.
+own. The app enforces HTTP Basic auth **only when** `MUSIC_SHIELD_BASIC_PASSWORD`
+is set (optional `MUSIC_SHIELD_BASIC_USER`, default `musicshield`). Set it on
+every shared instance, choose the value out of band, and never commit it or
+paste it into an issue, commit message, or this file.
 
 ## What the app needs
 
@@ -62,7 +64,8 @@ Then put Caddy or nginx in front with basic auth and TLS. Bind to
 
 ## Things to change before anyone else uses it
 
-1. Add authentication (even a shared password via basic auth).
+1. Set `MUSIC_SHIELD_BASIC_PASSWORD` (the built-in basic auth) or put a
+   proper login in front. Rotate it if it ever leaks.
 2. Lower `MUSIC_SHIELD_MAX_UPLOAD_MB` and consider a shorter
    `MUSIC_SHIELD_JOB_TTL_S`.
 3. Consider moving processing to a background worker if you see request
