@@ -41,7 +41,7 @@ import numpy as np
 
 from music_shield import perturb
 from music_shield.codec_eval import MEL_BANDS, MEL_DYNAMIC_RANGE_DB, MEL_FMAX_HZ, _log_mel, _mel_filterbank
-from music_shield.perturb import DEFAULT_PRESET, protect
+from music_shield.perturb import protect
 
 SEGMENT_S = 0.05
 ACTIVE_FLOOR_DBFS = -60.0
