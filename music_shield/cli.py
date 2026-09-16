@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 
 from music_shield.audio_io import load_audio, output_extension_for, save_audio
+from music_shield.codec_eval import BUILTIN_CLIPS, CODECS, ffmpeg_encoder_available, run_report
 from music_shield.perturb import DEFAULT_PRESET, PRESETS, protect
 from music_shield.synth import generate_tone
 
@@ -46,6 +47,22 @@ def _cmd_presets(_: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_codec_metrics(args: argparse.Namespace) -> int:
+    codecs = [c.strip() for c in args.codecs.split(",") if c.strip()]
+    bitrates = [int(b) for b in args.bitrates.split(",") if b.strip()]
+    for codec in codecs:
+        encoder = CODECS[codec][0] if codec in CODECS else codec
+        if not ffmpeg_encoder_available(encoder):
+            print(f"error: ffmpeg with the '{encoder}' encoder is required for {codec} round-trips.", file=sys.stderr)
+            return 1
+    reports, table = run_report(args.clip, presets=args.presets or None, codecs=codecs, bitrates=bitrates, seed=args.seed)
+    if args.json:
+        print(json.dumps([r.as_dict() for r in reports], indent=2))
+    else:
+        print(table)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="music_shield",
@@ -69,6 +86,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("presets", help="List strength presets")
     s.set_defaults(func=_cmd_presets)
+
+    m = sub.add_parser(
+        "codec-metrics",
+        help="Measure how much of the perturbation remains after an MP3/AAC round-trip (needs ffmpeg)",
+        description=(
+            "Protect a clip, re-encode both the original and the protected file with ffmpeg, decode, "
+            "and report how much change remains. These are change-remaining numbers, not efficacy claims; "
+            "see METRICS.md."
+        ),
+    )
+    m.add_argument("--clip", default="busy", help=f"One of {', '.join(BUILTIN_CLIPS)} (synthetic) or a path to a WAV/FLAC you own")
+    m.add_argument("--presets", nargs="*", choices=list(PRESETS), help="Presets to evaluate (default: all)")
+    m.add_argument("--codecs", default="mp3", help="Comma-separated: mp3, aac (default: mp3)")
+    m.add_argument("--bitrates", default="192,128", help="Comma-separated kbps (default: 192,128)")
+    m.add_argument("--seed", type=int, default=1234)
+    m.add_argument("--json", action="store_true", help="Print full JSON instead of a markdown table")
+    m.set_defaults(func=_cmd_codec_metrics)
     return parser
 
 
