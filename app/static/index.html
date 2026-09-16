@@ -95,9 +95,10 @@
       <div class="card soft">
         <h2>What this does</h2>
         <ul>
+          <li>Applies a slowly drifting micro-EQ wobble across the spectrum that alters spectrogram features without a fixed pattern, and that survives MP3/AAC re-encoding because it rides on the music itself.</li>
+          <li>Slowly rotates the phase of the track's own components (the same way on every channel), a change that is hard to hear but that lossy codecs pass through.</li>
           <li>Adds pseudo-random noise shaped under a simple masking curve, so it hides behind the music instead of sounding like flat hiss.</li>
-          <li>Applies a slowly drifting, band-wise micro-EQ wobble that alters spectrogram features without a fixed pattern.</li>
-          <li>Adds a low-level component above 15&nbsp;kHz when the sample rate allows.</li>
+          <li>Adds a very low-level component above 15&nbsp;kHz when the sample rate allows; codecs remove this one, so nothing relies on it.</li>
           <li>Runs entirely on this server with free, open tooling. No accounts, no uploads to third parties, originals are deleted after processing.</li>
           <li>Returns a lossless WAV or FLAC so the perturbation is not smoothed away by re-encoding.</li>
         </ul>
@@ -106,7 +107,7 @@
         <h2>What this does not do</h2>
         <ul>
           <li>It is <strong>not AI-proof</strong>, not DRM, and not proof of ownership.</li>
-          <li>Re-encoding to MP3/AAC, denoising, remixing, pitch-shifting, or resampling can weaken or remove it.</li>
+          <li>Re-encoding to MP3/AAC at 128–192 kbps keeps most of the change but the codec’s own error is larger than the perturbation; denoising, remixing, pitch-shifting, or resampling can weaken or remove it. Measurements are in <code>METRICS.md</code>.</li>
           <li>A determined or adaptive attacker who knows the method can likely undo most of it.</li>
           <li>We have not measured how much it degrades any specific AI model, and we will not invent a number.</li>
           <li>Use it only on recordings you own or are allowed to modify. It is not a tool for handling other people’s music.</li>
