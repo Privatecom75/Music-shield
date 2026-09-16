@@ -19,14 +19,15 @@ otherwise handling other people's music.
 
 ## What it does
 
-The engine (`music_shield/perturb.py`) combines three model-free components and
+The engine (`music_shield/perturb.py`) combines four model-free components and
 mixes them into a lossless output:
 
 | Component | What it is | Why |
 | --- | --- | --- |
-| Masked noise | Pseudo-random noise whose per-bin level sits under a simplified masking curve computed from the track's own band energies | Hides behind loud content instead of sounding like flat hiss; changes fine spectral detail |
-| Spectral jitter | A slowly drifting gain wobble across 32 log-spaced bands (a time-varying micro-EQ, ±0.4 dB at the default preset) | Multiplicative rather than additive, so simple noise subtraction does not undo it |
-| High-band component | Low-level energy above 15 kHz, following the track's loudness envelope, only when the sample rate allows | Cheap extra change in a region most adults barely hear; disappears if the file is downsampled |
+| Spectral jitter | A slowly drifting gain wobble on ~34 knots over a warped frequency scale, interpolated smoothly across bins (a time-varying micro-EQ, ±0.6 dB peak at the default preset) | Multiplicative on the track's own content, so codecs that reproduce the music also reproduce the wobble; the only component that moves magnitude spectrograms |
+| Phase drift | A slow per-knot rotation of the STFT phase (a time-varying all-pass, ±3° peak at the default preset), identical on all channels | Hearing is nearly insensitive to slow monaural phase changes, codecs pass it through, and the stereo image does not move. Changes the waveform and complex spectrum; leaves magnitude spectrograms essentially untouched |
+| Masked noise | Pseudo-random noise whose per-bin level sits under a simplified masking curve computed from the track's own band energies | Hides behind loud content instead of sounding like flat hiss; changes fine spectral detail. Kept small at `light` because codecs largely replace it with their own noise |
+| High-band component | Very low-level energy above 15 kHz, following the track's loudness envelope, only when the sample rate allows | Cheap extra change in a region most adults barely hear. Removed by every common lossy encoder's low-pass, so it is no longer relied on |
 
 Digital silence stays silent. If the result would clip, the whole file is
 scaled down rather than hard-clipped, and the UI tells you.
@@ -35,6 +36,12 @@ Three presets: `light` (default, conservative), `medium`, `strong`. The
 returned "change level (SNR)" number describes how much the file changed —
 higher means smaller change. It says nothing about how well the file is
 protected; nobody can honestly give you that number and this tool does not try.
+
+How much of the change survives an MP3/AAC re-encode is measured, on synthetic
+clips only, in [METRICS.md](METRICS.md). Short version: at MP3 128 kbps about
+94 % of the `light` change is still in the decoded file, but the codec's own
+error is louder than our perturbation. Those are *change remaining* numbers,
+not protection efficacy.
 
 What it deliberately does **not** do in v1: model-targeted adversarial
 optimisation (no gradient attacks against specific models), and audio
@@ -99,6 +106,10 @@ python -m music_shield demo
 
 # list presets
 python -m music_shield presets
+
+# measure how much change remains after an MP3 / AAC round-trip (needs ffmpeg)
+python -m music_shield codec-metrics                          # synthetic "busy" clip, all presets, 192k + 128k
+python -m music_shield codec-metrics --clip my-track.wav --presets light --codecs mp3,aac --json
 ```
 
 ## Tests
@@ -113,6 +124,14 @@ checks that the output differs from the input, contains no NaN/inf, stays
 under the peak ceiling, keeps digital silence silent, is reproducible for a
 fixed seed, and that presets are ordered by strength. The API tests exercise
 upload → protect → download, unsupported formats, and corrupt input.
+
+`tests/test_codec_roundtrip.py` (skipped without `ffmpeg` + `libmp3lame`)
+re-encodes protected and unprotected clips to MP3 at 192k and 128k, decodes
+them, and asserts that the difference is still there above a documented floor,
+that the `light` SNR stays conservative, that nothing clips or goes NaN, that
+jitter/phase are shared across channels, and — as a negative control — that a
+>15 kHz-only perturbation is removed by the codec. Floors are listed in
+[METRICS.md](METRICS.md).
 
 ## API
 
@@ -130,18 +149,22 @@ behind a login or a reverse proxy with basic auth (see [DEPLOY.md](DEPLOY.md)).
 ## Project layout
 
 ```
-music_shield/      engine (perturb.py), audio I/O, synthetic signals, CLI
+music_shield/      engine (perturb.py), codec round-trip metrics (codec_eval.py),
+                   audio I/O, synthetic signals, CLI
 app/main.py        FastAPI server
 app/static/        plain HTML / CSS / JS front end
 tests/             pytest suite
 LIMITS.md          honest failure modes
+METRICS.md         what survives an MP3/AAC re-encode, and how it was measured
 DEPLOY.md          $0 / cheap hosting notes (no automation)
 ```
 
 ## Roadmap (not promises)
 
 - Listening tests on real material to tune the presets — the current values
-  are based on SNR and a handful of synthetic signals, not on human trials.
+  are based on SNR, construction arguments and a handful of synthetic
+  signals, not on human trials.
+- Run `codec-metrics` on real, licensed material rather than synthetic clips.
 - Evaluate against actual open-source audio models and publish whatever we
   find, including if the answer is "it barely matters".
 - Optional watermark for ownership marking (deferred from v1; verification was

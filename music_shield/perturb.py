@@ -1,21 +1,35 @@
 """Psychoacoustically-shaped perturbation engine.
 
 The goal is to add a small, deterministic-per-job perturbation to a track that
-is hard to hear but changes the spectrogram-level features that audio ML
-models consume. This is *friction*, not protection: see LIMITS.md.
+is hard to hear but changes the features that audio ML models consume. This is
+*friction*, not protection: see LIMITS.md. METRICS.md has measurements of how
+much of the change survives a lossy re-encode.
 
-Three components are combined:
+Four components are combined:
 
-1. Masked noise — pseudo-random noise whose per-bin amplitude sits under a
+1. Spectral jitter — a slowly drifting gain wobble (a time-varying micro-EQ)
+   defined on ~30 knots spread over a warped frequency scale and interpolated
+   smoothly across bins, so it has no hard band edges. It is *multiplicative*
+   on the track's own content: a codec that reproduces the loud parts of the
+   spectrum accurately also reproduces the wobble, which is why this survives
+   MP3/AAC far better than additive noise.
+2. Phase drift — a slow, per-knot rotation of the STFT phase (a time-varying
+   all-pass). Human hearing is nearly insensitive to slow monaural phase
+   changes and the drift is shared across channels so the stereo image does
+   not move, yet the waveform and the complex spectrum change substantially
+   and lossy codecs reproduce the change faithfully. Magnitude spectrograms
+   are almost untouched by this component; it targets waveform / complex-
+   spectrum features, not mel features.
+3. Masked noise — pseudo-random noise whose per-bin amplitude sits under a
    simplified masking curve derived from the track's own spectrum. Loud
    regions can hide more noise than quiet ones, so the noise "follows" the
-   music instead of being a flat hiss.
-2. Spectral jitter — a slowly drifting, band-wise gain wobble (a time-varying
-   micro-EQ). This is multiplicative rather than additive, so it survives
-   simple noise-subtraction better than component 1 alone.
-3. High-band perturbation — extra energy in the mostly-inaudible top of the
+   music instead of being a flat hiss. Lossy codecs replace much of this with
+   their own quantisation noise; it is kept small at `light`.
+4. High-band perturbation — extra energy in the mostly-inaudible top of the
    spectrum (above ~15 kHz) when the sample rate allows. Cheap friction that
-   many feature extractors still see; disappears if the file is downsampled.
+   some feature extractors still see, but it is removed by the low-pass
+   filter in every common lossy encoder, so it is now kept very low and is
+   not counted on for anything after a re-encode.
 
 The masking model here is deliberately simple (band energies, a fixed offset,
 neighbour spreading). It is not an MPEG psychoacoustic model and it makes no
@@ -36,6 +50,17 @@ ABSOLUTE_FLOOR_DB = -85.0
 NUM_BANDS = 32
 HF_BAND_START_HZ = 15_000.0
 
+# Jitter / phase knots: at least this far apart in Hz at the bottom of the
+# spectrum (wider than the STFT main lobe, so one low partial is not split
+# across several knots) and this many per octave higher up.
+KNOT_MIN_SPACING_HZ = 150.0
+KNOTS_PER_OCTAVE = 6.0
+KNOT_START_HZ = 50.0
+# Phase drift is faded in between these frequencies; DC and sub-bass keep
+# their phase so the rotation never turns into a DC offset.
+PHASE_FADE_LO_HZ = 20.0
+PHASE_FADE_HI_HZ = 50.0
+
 
 @dataclass(frozen=True)
 class Preset:
@@ -46,11 +71,13 @@ class Preset:
     description: str
     # Noise sits this many dB *below* the estimated masking curve.
     noise_offset_db: float
-    # Peak-to-peak size of the band gain wobble, in dB.
+    # Peak size of the interpolated gain wobble, in dB (reached at 2 sigma).
     jitter_db: float
-    # Level of the high-band component relative to full scale, in dB.
+    # Peak size of the phase drift, in degrees (reached at 2 sigma).
+    phase_deg: float
+    # Level of the high-band component relative to the track RMS, in dB.
     hf_level_db: float
-    # Smoothing window for the jitter random walk, in seconds.
+    # Smoothing window for the jitter / phase random walks, in seconds.
     jitter_smooth_s: float
 
 
@@ -59,27 +86,30 @@ PRESETS: dict[str, Preset] = {
         name="light",
         label="Light (default)",
         description="Conservative. Aims to stay below what most listeners notice on normal playback.",
-        noise_offset_db=-12.0,
-        jitter_db=0.4,
-        hf_level_db=-48.0,
+        noise_offset_db=-14.0,
+        jitter_db=0.6,
+        phase_deg=3.0,
+        hf_level_db=-56.0,
         jitter_smooth_s=0.8,
     ),
     "medium": Preset(
         name="medium",
         label="Medium",
         description="More change to the spectrogram. May be faintly audible on quiet, sparse passages.",
-        noise_offset_db=-7.0,
-        jitter_db=0.9,
-        hf_level_db=-40.0,
+        noise_offset_db=-8.0,
+        jitter_db=1.0,
+        phase_deg=5.0,
+        hf_level_db=-48.0,
         jitter_smooth_s=0.5,
     ),
     "strong": Preset(
         name="strong",
         label="Strong",
         description="Trades listening quality for more disruption. Expect audible texture on headphones.",
-        noise_offset_db=-3.0,
-        jitter_db=1.5,
-        hf_level_db=-32.0,
+        noise_offset_db=-4.0,
+        jitter_db=1.8,
+        phase_deg=10.0,
+        hf_level_db=-40.0,
         jitter_smooth_s=0.3,
     ),
 }
@@ -140,6 +170,10 @@ def _istft(spec: np.ndarray, length: int) -> np.ndarray:
     return out[pad : pad + length]
 
 
+def _n_frames_for(length: int) -> int:
+    return 1 + (length + 3 * N_FFT - N_FFT) // HOP
+
+
 def _band_edges(sample_rate: int, n_bins: int) -> np.ndarray:
     """Log-spaced band edges (in bin indices) from ~50 Hz to Nyquist."""
     nyq = sample_rate / 2.0
@@ -181,17 +215,83 @@ def _masking_curve(power: np.ndarray, edges: np.ndarray, band_of_bin: np.ndarray
 
 
 def _smooth_walk(rng: np.random.Generator, n_frames: int, smooth_frames: int, n_series: int) -> np.ndarray:
-    """Smoothed Gaussian noise per series, normalised to roughly unit std."""
-    raw = rng.standard_normal((n_series, n_frames + 2 * smooth_frames))
-    kernel = np.ones(max(1, smooth_frames)) / max(1, smooth_frames)
+    """Smoothed Gaussian noise per series, normalised to roughly unit std.
+
+    A Hann kernel (rather than a boxcar) keeps the walk's derivative smooth,
+    so the modulation has no fast, tremolo-like components.
+    """
+    width = max(2, 2 * smooth_frames)
+    raw = rng.standard_normal((n_series, n_frames + 2 * width))
+    kernel = np.hanning(width + 2)[1:-1]
+    kernel /= kernel.sum()
     smoothed = np.stack([np.convolve(r, kernel, mode="same") for r in raw])
-    smoothed = smoothed[:, smooth_frames : smooth_frames + n_frames]
+    smoothed = smoothed[:, width : width + n_frames]
     std = smoothed.std(axis=1, keepdims=True)
     std[std < 1e-9] = 1.0
     return smoothed / std
 
 
-def _perturb_channel(x: np.ndarray, sample_rate: int, preset: Preset, rng: np.random.Generator) -> tuple[np.ndarray, bool]:
+def knot_frequencies(sample_rate: int) -> np.ndarray:
+    """Knot centres in Hz for the jitter / phase components.
+
+    Walks up from KNOT_START_HZ taking steps of at least KNOT_MIN_SPACING_HZ
+    (so low partials are not split across knots) and at most 1/KNOTS_PER_OCTAVE
+    octave. Ends at Nyquist.
+    """
+    nyq = sample_rate / 2.0
+    ratio = 2 ** (1.0 / KNOTS_PER_OCTAVE)
+    knots = [KNOT_START_HZ]
+    while True:
+        f = knots[-1]
+        nxt = max(f + KNOT_MIN_SPACING_HZ, f * ratio)
+        if nxt >= nyq:
+            break
+        knots.append(nxt)
+    knots.append(nyq)
+    return np.asarray(knots)
+
+
+def _knot_interpolation(sample_rate: int, n_bins: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """Per-bin (lower knot index, upper knot index, weight of upper knot)."""
+    knots = knot_frequencies(sample_rate)
+    bin_hz = np.arange(n_bins) * (sample_rate / 2.0) / (n_bins - 1)
+    log_bins = np.log2(np.maximum(bin_hz, 1.0))
+    log_knots = np.log2(knots)
+    pos = np.interp(log_bins, log_knots, np.arange(len(knots), dtype=float))
+    lo = np.floor(pos).astype(int)
+    lo = np.clip(lo, 0, len(knots) - 2)
+    w = np.clip(pos - lo, 0.0, 1.0)
+    return lo, lo + 1, w, len(knots)
+
+
+def _modulation(rng: np.random.Generator, sample_rate: int, n_bins: int, n_frames: int, preset: Preset) -> np.ndarray:
+    """Complex per-bin, per-frame multiplier combining gain jitter and phase drift.
+
+    Shared by all channels of a file so that the stereo image is not modulated.
+    """
+    lo, hi, w, n_knots = _knot_interpolation(sample_rate, n_bins)
+    frames_per_s = sample_rate / HOP
+    smooth_frames = max(1, int(preset.jitter_smooth_s * frames_per_s))
+
+    gain_walk = _smooth_walk(rng, n_frames, smooth_frames, n_knots)
+    gain_db = np.clip(gain_walk * (preset.jitter_db / 2.0), -preset.jitter_db, preset.jitter_db)
+    gain_db_bins = gain_db[lo] * (1.0 - w)[:, None] + gain_db[hi] * w[:, None]
+
+    phase_walk = _smooth_walk(rng, n_frames, smooth_frames, n_knots)
+    phase_deg = np.clip(phase_walk * (preset.phase_deg / 2.0), -preset.phase_deg, preset.phase_deg)
+    phase_bins = np.deg2rad(phase_deg[lo] * (1.0 - w)[:, None] + phase_deg[hi] * w[:, None])
+    bin_hz = np.arange(n_bins) * (sample_rate / 2.0) / (n_bins - 1)
+    fade = np.clip((bin_hz - PHASE_FADE_LO_HZ) / (PHASE_FADE_HI_HZ - PHASE_FADE_LO_HZ), 0.0, 1.0)
+    fade[0] = 0.0
+    fade[-1] = 0.0
+    phase_bins *= fade[:, None]
+
+    return 10 ** (gain_db_bins / 20) * np.exp(1j * phase_bins)
+
+
+def _perturb_channel(
+    x: np.ndarray, sample_rate: int, preset: Preset, rng: np.random.Generator, modulation: np.ndarray
+) -> tuple[np.ndarray, bool]:
     n = len(x)
     spec = _stft(x)
     n_bins, n_frames = spec.shape
@@ -199,7 +299,10 @@ def _perturb_channel(x: np.ndarray, sample_rate: int, preset: Preset, rng: np.ra
     edges = _band_edges(sample_rate, n_bins)
     band_of_bin = _bin_to_band(edges, n_bins)
 
-    # 1. Masked noise, shaped under the estimated masking curve.
+    # 1 + 2. Spectral jitter and phase drift (multiplicative, shared across channels).
+    spec_mod = spec * modulation
+
+    # 3. Masked noise, shaped under the estimated masking curve.
     mask_power = _masking_curve(power, edges, band_of_bin)
     noise_power = mask_power * 10 ** (preset.noise_offset_db / 10)
     # Never inject noise into bins where the track itself is essentially silent
@@ -210,17 +313,9 @@ def _perturb_channel(x: np.ndarray, sample_rate: int, preset: Preset, rng: np.ra
     # Mask and noise are both in STFT units, so no window scaling is needed.
     noise_spec = np.sqrt(noise_power) * np.exp(1j * phase)
 
-    # 2. Spectral jitter: slowly drifting band gains (multiplicative).
-    frames_per_s = sample_rate / HOP
-    smooth_frames = max(1, int(preset.jitter_smooth_s * frames_per_s))
-    walk = _smooth_walk(rng, n_frames, smooth_frames, NUM_BANDS)
-    gain_db = np.clip(walk * (preset.jitter_db / 2.0), -preset.jitter_db, preset.jitter_db)
-    gain = 10 ** (gain_db / 20)
-    spec_jittered = spec * gain[band_of_bin]
+    y = _istft(spec_mod + noise_spec, n)
 
-    y = _istft(spec_jittered + noise_spec, n)
-
-    # 3. High-band perturbation, only if the sample rate actually has room.
+    # 4. High-band perturbation, only if the sample rate actually has room.
     hf_applied = False
     hf_start_bin = int(HF_BAND_START_HZ / (sample_rate / 2.0) * (n_bins - 1))
     if hf_start_bin < n_bins - 4:
@@ -263,13 +358,18 @@ def protect(audio: np.ndarray, sample_rate: int, preset_name: str = DEFAULT_PRES
 
     x = audio.astype(np.float64)
     base_rng = np.random.default_rng(seed)
+    modulation_seed = int(base_rng.integers(0, 2**63 - 1))
     channel_seeds = base_rng.integers(0, 2**63 - 1, size=x.shape[1])
+
+    n_bins = N_FFT // 2 + 1
+    n_frames = _n_frames_for(x.shape[0])
+    modulation = _modulation(np.random.default_rng(modulation_seed), sample_rate, n_bins, n_frames, preset)
 
     out = np.empty_like(x)
     hf_any = False
     for ch in range(x.shape[1]):
         rng = np.random.default_rng(int(channel_seeds[ch]))
-        out[:, ch], hf = _perturb_channel(x[:, ch], sample_rate, preset, rng)
+        out[:, ch], hf = _perturb_channel(x[:, ch], sample_rate, preset, rng, modulation)
         hf_any = hf_any or hf
 
     original_peak = float(np.abs(x).max()) if x.size else 0.0
