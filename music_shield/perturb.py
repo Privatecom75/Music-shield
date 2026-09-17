@@ -108,7 +108,7 @@ class ProtectStats:
 
 
 def _hann(n: int) -> np.ndarray:
-    return np.hanning(n + 1)[:-1].astype(np.float64)
+    return np.hanning(n + 1)[:-1].astype(np.float32)
 
 
 def _stft(x: np.ndarray) -> np.ndarray:
@@ -247,7 +247,7 @@ def _perturb_channel(x: np.ndarray, sample_rate: int, preset: Preset, rng: np.ra
 def protect(audio: np.ndarray, sample_rate: int, preset_name: str = DEFAULT_PRESET, seed: int | None = None) -> tuple[np.ndarray, ProtectStats]:
     """Apply the perturbation to a (samples, channels) float array in [-1, 1].
 
-    Returns the protected audio (same shape, float64) and change statistics.
+    Returns the protected audio (same shape, float32) and change statistics.
     """
     if preset_name not in PRESETS:
         raise ValueError(f"Unknown preset '{preset_name}'. Choose one of: {', '.join(PRESETS)}")
@@ -261,7 +261,7 @@ def protect(audio: np.ndarray, sample_rate: int, preset_name: str = DEFAULT_PRES
     if not np.isfinite(audio).all():
         raise ValueError("Input audio contains NaN or infinite samples.")
 
-    x = audio.astype(np.float64)
+    x = np.ascontiguousarray(audio, dtype=np.float32)
     base_rng = np.random.default_rng(seed)
     channel_seeds = base_rng.integers(0, 2**63 - 1, size=x.shape[1])
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import io
 import json
 import os
@@ -188,6 +189,8 @@ async def protect_endpoint(file: UploadFile = File(...), strength: str = Form(DE
         output_name = f"{_safe_stem(file.filename)}-protected{out_ext}"
         output_path = job_dir / f"output{out_ext}"
         save_audio(output_path, protected, loaded.sample_rate, loaded.subtype)
+        del protected, loaded
+        gc.collect()
     except (UnsupportedFormatError, AudioTooLongError, ValueError) as exc:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(status_code=422, detail=str(exc)) from exc
