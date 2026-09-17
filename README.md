@@ -99,10 +99,13 @@ pipeline and presets.
 | `MUSIC_SHIELD_DATA_DIR` | `$TMPDIR/music_shield_jobs` | Where protected outputs are kept until they expire |
 | `MUSIC_SHIELD_JOB_TTL_S` | `3600` | Seconds before a protected file is deleted |
 | `MUSIC_SHIELD_MAX_UPLOAD_MB` | `80` | Upload size limit |
+| `MUSIC_SHIELD_MEMORY_BUDGET_MB` | `512` | RAM the host has; sizes the guard that rejects tracks too big to protect in memory |
 
-Tracks longer than 15 minutes are rejected. Originals are deleted as soon as
-processing finishes; only the protected output is kept, and only until it
-expires.
+Tracks longer than 15 minutes are rejected, and so are tracks that would not
+fit the memory budget — about 6.3 minutes of stereo or 12.7 minutes of mono
+at 44.1 kHz on the default 512 MB (see LIMITS.md). Originals are deleted as
+soon as processing finishes; only the protected output is kept, and only
+until it expires.
 
 ## CLI
 

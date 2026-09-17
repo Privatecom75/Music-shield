@@ -115,8 +115,24 @@ component contribute almost nothing to magnitude features after a re-encode.
 ## Operational limits
 
 - Tracks over 15 minutes and uploads over 80 MB are rejected (configurable).
-- Processing is synchronous. A 10-minute stereo 48 kHz WAV takes a few seconds
-  on a laptop and considerably longer on a free-tier container.
+- There is also a **memory guard**, and on a small host it is the limit you
+  will actually hit. One job holds the float32 input and the float32 output
+  together (8 bytes per sample per channel); everything else is a fixed
+  overhead. The server admits `(MUSIC_SHIELD_MEMORY_BUDGET_MB - 256) MiB / 8`
+  sample-channels per job and rejects anything bigger with HTTP 413 *before*
+  decoding it (from the WAV/FLAC header or ffprobe), instead of being
+  OOM-killed halfway through. With the default 512 MB budget that is:
+  **~6.3 min of stereo or ~12.7 min of mono at 44.1 kHz** (5.8 / 11.6 min at
+  48 kHz). Stereo counts double; a mono upload of the same length always fits
+  where the stereo one does not. `/api/info` reports the effective numbers and
+  the error message quotes the limit for the file's own rate and layout.
+  Measured on the streaming engine: a 200 s stereo MP3 peaks at ~290 MiB of
+  server RSS, a file at the guard limit at ~430 MiB. Raise
+  `MUSIC_SHIELD_MEMORY_BUDGET_MB` on a bigger host.
+- Processing is synchronous and one job runs at a time; a second upload
+  waits for the first to finish (the memory guard budgets for a single job).
+  A 6-minute stereo 44.1 kHz WAV takes ~3 s on a laptop core and considerably
+  longer on a free-tier container.
 - Protected files are kept for one hour then deleted. Originals are deleted as
   soon as processing finishes. There is no account, so there is no way to
   recover a file after it expires.
