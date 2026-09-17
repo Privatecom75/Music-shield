@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import gc
 import io
 import json
@@ -14,6 +15,7 @@ import time
 import uuid
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 import soundfile as sf
@@ -23,8 +25,10 @@ from music_shield.audio_io import (
     AudioTooLargeError,
     AudioTooLongError,
     MAX_DURATION_S,
+    MAX_SAMPLE_FRAMES,
     UnsupportedFormatError,
     load_audio,
+    max_duration_for,
     output_extension_for,
     save_audio,
     supported_input_extensions,
@@ -43,6 +47,13 @@ DEMO_FILENAME = "music-shield-demo.wav"
 app = FastAPI(title="Music Shield", version=__version__, docs_url=None, redoc_url=None)
 
 _demo_clip_cache: bytes | None = None
+
+# One protect job at a time. The size guard in audio_io budgets memory for a
+# single job (input + output + chunk buffers); two jobs in flight on a 512 MB
+# host would double that and get the whole service OOM-killed. Concurrent
+# uploads wait for their turn instead. The job itself runs in a worker thread
+# so the event loop (health checks, downloads) stays responsive meanwhile.
+_PROCESS_LOCK = asyncio.Lock()
 
 # Public hosts: set MUSIC_SHIELD_BASIC_PASSWORD (and optional MUSIC_SHIELD_BASIC_USER).
 # Unset password => auth off (local dev). When set, every request needs HTTP Basic.
@@ -93,6 +104,28 @@ def _safe_stem(filename: str | None) -> str:
     return cleaned[:80] or "track"
 
 
+def _process_job(input_path: Path, job_dir: Path, strength: str, filename: str | None) -> dict:
+    """Load -> protect -> save, holding at most input + output in memory at once."""
+    loaded = load_audio(input_path)
+    source_ext = loaded.source_extension
+    sample_rate = loaded.sample_rate
+    subtype = loaded.subtype
+    samples = loaded.samples
+    del loaded
+    protected, stats = protect(samples, sample_rate, strength, seed=secrets.randbits(63))
+    # The decoded input is not needed for the write; release it first so the
+    # save never has three copies of the track alive.
+    del samples
+    out_ext = output_extension_for(source_ext)
+    output_name = f"{_safe_stem(filename)}-protected{out_ext}"
+    output_path = job_dir / f"output{out_ext}"
+    save_audio(output_path, protected, sample_rate, subtype)
+    stats_dict = stats.as_dict()
+    del protected, stats
+    gc.collect()
+    return {"output_name": output_name, "out_ext": out_ext, "source_ext": source_ext, "stats": stats_dict}
+
+
 def _cleanup_expired() -> None:
     now = time.time()
     for job_dir in DATA_DIR.iterdir():
@@ -121,6 +154,11 @@ def info() -> dict:
         "accepted_extensions": supported_input_extensions(),
         "max_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024),
         "max_duration_minutes": MAX_DURATION_S // 60,
+        # Memory guard: frames * channels admitted per job, and what that means
+        # for the common case so the UI can say something truthful.
+        "max_sample_frames": MAX_SAMPLE_FRAMES,
+        "max_stereo_minutes_44k": round(max_duration_for(44100, 2) / 60, 1),
+        "max_mono_minutes_44k": round(min(max_duration_for(44100, 1), MAX_DURATION_S) / 60, 1),
         "job_ttl_minutes": JOB_TTL_S // 60,
         "demo": {
             "url": "/api/demo-clip",
@@ -184,18 +222,12 @@ async def protect_endpoint(file: UploadFile = File(...), strength: str = Form(DE
         raise HTTPException(status_code=400, detail="The uploaded file is empty.")
 
     try:
-        loaded = load_audio(input_path)
-        source_ext = loaded.source_extension
-        sample_rate = loaded.sample_rate
-        subtype = loaded.subtype
-        protected, stats = protect(loaded.samples, sample_rate, strength, seed=secrets.randbits(63))
-        out_ext = output_extension_for(source_ext)
-        output_name = f"{_safe_stem(file.filename)}-protected{out_ext}"
-        output_path = job_dir / f"output{out_ext}"
-        save_audio(output_path, protected, sample_rate, subtype)
-        stats_dict = stats.as_dict()
-        del protected, loaded, stats
-        gc.collect()
+        async with _PROCESS_LOCK:
+            result = await run_in_threadpool(_process_job, input_path, job_dir, strength, file.filename)
+        output_name = result["output_name"]
+        out_ext = result["out_ext"]
+        source_ext = result["source_ext"]
+        stats_dict = result["stats"]
     except AudioTooLargeError as exc:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(status_code=413, detail=str(exc)) from exc

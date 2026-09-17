@@ -12,9 +12,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import json
+import os
 import shutil
 import subprocess
-import tempfile
 
 import numpy as np
 import soundfile as sf
@@ -22,9 +22,25 @@ import soundfile as sf
 SUPPORTED_INPUT_EXTENSIONS = {".wav", ".flac", ".mp3"}
 LOSSLESS_OUTPUT = {".wav": "WAV", ".flac": "FLAC"}
 MAX_DURATION_S = 15 * 60
-# Soft ceiling for free-tier RAM (~512MB): stereo float32 ~8 bytes/frame across
-# load+protect working set. Reject earlier with a clean error instead of 502/OOM.
-MAX_SAMPLE_FRAMES = 12 * 60 * 48000  # ~12 min @ 48 kHz mono-equivalent budget; stereo counts 2x below
+
+# Memory model for one protect job, used to reject a file *before* decoding it
+# rather than letting the host OOM-kill the service (measured on the streaming
+# engine, see LIMITS.md "Operational limits"):
+#
+#   peak ~= fixed overhead + BYTES_PER_FRAME_CHANNEL * frames * channels
+#
+# The float32 input and the float32 output are alive together (2 * 4 bytes per
+# sample); the MP3 decode path has the same 2x moment (ffmpeg's pipe buffer and
+# its numpy copy). Everything else -- interpreter, numpy/scipy/fastapi, the
+# ~40 MB chunked-STFT working set, ffmpeg's own process, page cache for the
+# output write -- measured at ~155 MiB on a warm server; 256 MB leaves ~100 MB
+# of headroom under a 512 MB host at the largest admitted file.
+MEMORY_BUDGET_MB = int(os.environ.get("MUSIC_SHIELD_MEMORY_BUDGET_MB", "512"))
+FIXED_OVERHEAD_MB = 256
+BYTES_PER_FRAME_CHANNEL = 8
+MAX_SAMPLE_FRAMES = max(1, MEMORY_BUDGET_MB - FIXED_OVERHEAD_MB) * 1024 * 1024 // BYTES_PER_FRAME_CHANNEL
+# Frames per block when writing the output (~1 MB per channel of float32).
+WRITE_BLOCK_FRAMES = 1 << 18
 
 
 class UnsupportedFormatError(ValueError):
@@ -68,12 +84,22 @@ def _check_duration(frames: int, sample_rate: int) -> None:
         )
 
 
-def _check_size(frames: int, channels: int) -> None:
-    # Count stereo as 2x frames toward the budget.
-    if frames * max(channels, 1) > MAX_SAMPLE_FRAMES:
+def max_duration_for(sample_rate: int, channels: int) -> float:
+    """Longest track (seconds) the memory budget admits at this rate / channel count."""
+    return MAX_SAMPLE_FRAMES / (max(sample_rate, 1) * max(channels, 1))
+
+
+def _check_size(frames: int, channels: int, sample_rate: int) -> None:
+    # Every channel costs the same as a frame of mono: stereo counts 2x.
+    channels = max(channels, 1)
+    if frames * channels > MAX_SAMPLE_FRAMES:
+        limit_s = max_duration_for(sample_rate, channels)
+        limit = f"{limit_s / 60:.1f} minutes" if limit_s >= 60 else f"{int(limit_s)} second{'s' if int(limit_s) != 1 else ''}"
+        layout = {1: "mono", 2: "stereo"}.get(channels, f"{channels}-channel")
         raise AudioTooLargeError(
-            "Track is too large for this server’s memory budget. "
-            "Try a shorter clip, mono, or upload WAV/FLAC under a few minutes."
+            f"Track is too large for this server’s memory budget: about {limit} of "
+            f"{layout} audio at {sample_rate} Hz is the most it can protect in one go. "
+            "Trim it, split it, or upload a mono version."
         )
 
 
@@ -111,7 +137,7 @@ def _decode_mp3_f32(path: Path) -> tuple[np.ndarray, int]:
     sr, ch, frames = _ffprobe_stream(path)
     if frames:
         _check_duration(frames, sr)
-        _check_size(frames, ch)
+        _check_size(frames, ch, sr)
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-i", str(path),
@@ -128,7 +154,7 @@ def _decode_mp3_f32(path: Path) -> tuple[np.ndarray, int]:
     data = data.reshape(-1, ch).copy()  # detach from readonly buffer
     del result
     _check_duration(data.shape[0], sr)
-    _check_size(data.shape[0], ch)
+    _check_size(data.shape[0], ch, sr)
     return data, sr
 
 
@@ -151,7 +177,7 @@ def load_audio(path: str | Path) -> LoadedAudio:
     except sf.LibsndfileError as exc:
         raise UnsupportedFormatError(f"Could not read this file as {ext}: {exc}") from exc
     _check_duration(info.frames, info.samplerate)
-    _check_size(info.frames, info.channels)
+    _check_size(info.frames, info.channels, info.samplerate)
     data, sr = sf.read(str(path), dtype="float32", always_2d=True)
     subtype = info.subtype if info.subtype in {"PCM_16", "PCM_24", "PCM_32", "FLOAT", "DOUBLE"} else None
     return LoadedAudio(samples=data, sample_rate=int(sr), source_extension=ext, subtype=subtype)
@@ -171,5 +197,13 @@ def save_audio(path: str | Path, samples: np.ndarray, sample_rate: int, subtype:
     chosen = subtype or "PCM_16"
     if fmt == "FLAC" and chosen not in {"PCM_16", "PCM_24"}:
         chosen = "PCM_24"
-    clipped = np.clip(samples, -1.0, 1.0).astype(np.float32, copy=False)
-    sf.write(str(path), clipped, sample_rate, format=fmt, subtype=chosen)
+    samples = np.asarray(samples)
+    if samples.ndim == 1:
+        samples = samples[:, None]
+    # Clip and write block by block instead of materialising a clipped copy of
+    # the whole track next to the original.
+    with sf.SoundFile(str(path), mode="w", samplerate=sample_rate, channels=samples.shape[1], format=fmt, subtype=chosen) as out:
+        for start in range(0, samples.shape[0], WRITE_BLOCK_FRAMES):
+            block = samples[start : start + WRITE_BLOCK_FRAMES].astype(np.float32, copy=True)
+            np.clip(block, -1.0, 1.0, out=block)
+            out.write(block)
