@@ -107,6 +107,9 @@ def _safe_stem(filename: str | None) -> str:
 def _process_job(input_path: Path, job_dir: Path, strength: str, filename: str | None) -> dict:
     """Load -> protect -> save, holding at most input + output in memory at once."""
     loaded = load_audio(input_path)
+    # Decoded; the original is never kept, and deleting it now also drops its
+    # page cache before the memory-heavy part instead of after the job.
+    input_path.unlink(missing_ok=True)
     source_ext = loaded.source_extension
     sample_rate = loaded.sample_rate
     subtype = loaded.subtype
