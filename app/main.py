@@ -14,13 +14,14 @@ import tempfile
 import time
 import uuid
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 import soundfile as sf
 
 from music_shield import __version__
+from music_shield import export
 from music_shield.audio_io import (
     AudioTooLargeError,
     AudioTooLongError,
@@ -53,6 +54,8 @@ _demo_clip_cache: bytes | None = None
 # host would double that and get the whole service OOM-killed. Concurrent
 # uploads wait for their turn instead. The job itself runs in a worker thread
 # so the event loop (health checks, downloads) stays responsive meanwhile.
+# Lossy exports (an ffmpeg process of ~50-100 MiB) take the same lock so they
+# never run next to a protect job at its peak.
 _PROCESS_LOCK = asyncio.Lock()
 
 # Public hosts: set MUSIC_SHIELD_BASIC_PASSWORD (and optional MUSIC_SHIELD_BASIC_USER).
@@ -163,6 +166,11 @@ def info() -> dict:
         "max_stereo_minutes_44k": round(max_duration_for(44100, 2) / 60, 1),
         "max_mono_minutes_44k": round(min(max_duration_for(44100, 1), MAX_DURATION_S) / 60, 1),
         "job_ttl_minutes": JOB_TTL_S // 60,
+        # Download formats: lossless is the default; MP3/MP4 are lossy
+        # convenience exports and are only listed as available when this
+        # server's ffmpeg has the encoders.
+        "export_formats": export.describe_formats(),
+        "mp4_title_overlay": export.title_overlay_available(),
         "demo": {
             "url": "/api/demo-clip",
             "filename": DEMO_FILENAME,
@@ -249,26 +257,35 @@ async def protect_endpoint(file: UploadFile = File(...), strength: str = Form(DE
         "output_name": output_name,
         "output_ext": out_ext,
         "source_ext": source_ext,
+        "title": _safe_stem(file.filename),
         "stats": stats_dict,
         "created_at": time.time(),
     }
     (job_dir / "meta.json").write_text(json.dumps(meta))
+    download_url = f"/api/download/{job_id}"
     return JSONResponse(
         {
             "job_id": job_id,
-            "download_url": f"/api/download/{job_id}",
+            "download_url": download_url,
             "output_name": output_name,
             "output_ext": out_ext,
             "source_ext": source_ext,
             "converted_to_lossless": out_ext != source_ext,
+            # Lossy convenience copies, encoded on first request from the
+            # stored lossless file. Only formats this server can produce.
+            "export_urls": {
+                name: f"{download_url}?format={name}"
+                for name in export.LOSSY_NAMES
+                if export.unavailable_reason(name) is None
+            },
             "stats": stats_dict,
             "expires_in_minutes": JOB_TTL_S // 60,
         }
     )
 
 
-@app.get("/api/download/{job_id}")
-def download(job_id: str) -> FileResponse:
+def _load_job(job_id: str) -> tuple[Path, dict, Path]:
+    """Job directory, metadata and the stored lossless output, or 404."""
     if not (len(job_id) == 32 and all(c in "0123456789abcdef" for c in job_id)):
         raise HTTPException(status_code=404, detail="Not found.")
     job_dir = DATA_DIR / job_id
@@ -279,8 +296,58 @@ def download(job_id: str) -> FileResponse:
     output_path = job_dir / f"output{meta['output_ext']}"
     if not output_path.exists():
         raise HTTPException(status_code=404, detail="This download has expired.")
-    media = "audio/flac" if meta["output_ext"] == ".flac" else "audio/wav"
-    return FileResponse(output_path, media_type=media, filename=meta["output_name"])
+    return job_dir, meta, output_path
+
+
+@app.get("/api/download/{job_id}")
+async def download(job_id: str, fmt: str | None = Query(None, alias="format")) -> FileResponse:
+    """The protected file. Default: the stored lossless WAV/FLAC.
+
+    `?format=mp3|mp4` encodes a lossy convenience copy from that stored file
+    with ffmpeg on first request and caches it next to it for the job's TTL.
+    The perturbation is weaker after a lossy re-encode (LIMITS.md), so the
+    lossless file stays the default.
+    """
+    job_dir, meta, output_path = _load_job(job_id)
+    lossless_name = meta["output_ext"].lstrip(".")
+    name = (fmt or lossless_name).strip().lower()
+    if name not in export.FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown format '{fmt}'. Use one of: {', '.join(export.FORMATS)}.",
+        )
+    spec = export.FORMATS[name]
+
+    if not spec.lossy:
+        if name != lossless_name:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"This job's lossless output is {lossless_name.upper()}; request format={lossless_name} "
+                    "or omit format. Lossless files are not transcoded between WAV and FLAC."
+                ),
+            )
+        return FileResponse(output_path, media_type=spec.media_type, filename=meta["output_name"])
+
+    reason = export.unavailable_reason(name)
+    if reason:
+        raise HTTPException(status_code=501, detail=reason)
+
+    export_path = job_dir / f"export{spec.extension}"
+    if not export_path.exists():
+        async with _PROCESS_LOCK:
+            if not export_path.exists():
+                title = meta.get("title") or Path(meta["output_name"]).stem.removesuffix("-protected")
+                try:
+                    await run_in_threadpool(export.export_lossy, output_path, export_path, name, title)
+                except export.ExportUnavailableError as exc:
+                    raise HTTPException(status_code=501, detail=str(exc)) from exc
+                except export.ExportError as exc:
+                    raise HTTPException(
+                        status_code=500, detail=f"{spec.label.split(' ·')[0]} export failed on the server."
+                    ) from exc
+    export_name = f"{Path(meta['output_name']).stem}{spec.extension}"
+    return FileResponse(export_path, media_type=spec.media_type, filename=export_name)
 
 
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
