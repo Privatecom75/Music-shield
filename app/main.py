@@ -20,6 +20,7 @@ import soundfile as sf
 
 from music_shield import __version__
 from music_shield.audio_io import (
+    AudioTooLargeError,
     AudioTooLongError,
     MAX_DURATION_S,
     UnsupportedFormatError,
@@ -184,13 +185,20 @@ async def protect_endpoint(file: UploadFile = File(...), strength: str = Form(DE
 
     try:
         loaded = load_audio(input_path)
-        protected, stats = protect(loaded.samples, loaded.sample_rate, strength, seed=secrets.randbits(63))
-        out_ext = output_extension_for(loaded.source_extension)
+        source_ext = loaded.source_extension
+        sample_rate = loaded.sample_rate
+        subtype = loaded.subtype
+        protected, stats = protect(loaded.samples, sample_rate, strength, seed=secrets.randbits(63))
+        out_ext = output_extension_for(source_ext)
         output_name = f"{_safe_stem(file.filename)}-protected{out_ext}"
         output_path = job_dir / f"output{out_ext}"
-        save_audio(output_path, protected, loaded.sample_rate, loaded.subtype)
-        del protected, loaded
+        save_audio(output_path, protected, sample_rate, subtype)
+        stats_dict = stats.as_dict()
+        del protected, loaded, stats
         gc.collect()
+    except AudioTooLargeError as exc:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
     except (UnsupportedFormatError, AudioTooLongError, ValueError) as exc:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -205,8 +213,8 @@ async def protect_endpoint(file: UploadFile = File(...), strength: str = Form(DE
         "job_id": job_id,
         "output_name": output_name,
         "output_ext": out_ext,
-        "source_ext": loaded.source_extension,
-        "stats": stats.as_dict(),
+        "source_ext": source_ext,
+        "stats": stats_dict,
         "created_at": time.time(),
     }
     (job_dir / "meta.json").write_text(json.dumps(meta))
@@ -216,9 +224,9 @@ async def protect_endpoint(file: UploadFile = File(...), strength: str = Form(DE
             "download_url": f"/api/download/{job_id}",
             "output_name": output_name,
             "output_ext": out_ext,
-            "source_ext": loaded.source_extension,
-            "converted_to_lossless": out_ext != loaded.source_extension,
-            "stats": stats.as_dict(),
+            "source_ext": source_ext,
+            "converted_to_lossless": out_ext != source_ext,
+            "stats": stats_dict,
             "expires_in_minutes": JOB_TTL_S // 60,
         }
     )
