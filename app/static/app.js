@@ -16,6 +16,8 @@
   const result = $("result");
   const resultNote = $("result-note");
   const downloadLink = $("download-link");
+  const exportButtons = $("export-buttons");
+  const exportStatus = $("export-status");
   const statsEl = $("stats");
   const audioOriginal = $("audio-original");
   const audioProtected = $("audio-protected");
@@ -29,6 +31,8 @@
   let info = { accepted_extensions: [".wav", ".flac"], presets: [], max_upload_mb: 80, max_duration_minutes: 15, max_stereo_minutes_44k: null };
   let originalUrl = null;
   let busy = false;
+  let currentJob = null;
+  let exporting = false;
 
   const fmtBytes = (n) => (n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${Math.round(n / 1024)} KB`);
   const extOf = (name) => {
@@ -105,6 +109,77 @@
     });
   }
 
+  function stemOf(name) {
+    const i = name.lastIndexOf(".");
+    return i > 0 ? name.slice(0, i) : name;
+  }
+
+  function setExportStatus(msg) {
+    exportStatus.textContent = msg || "";
+  }
+
+  function updateExportButtons() {
+    exportButtons.querySelectorAll("button").forEach((b) => {
+      b.disabled = exporting || !currentJob || b.dataset.available !== "1";
+    });
+  }
+
+  function renderExportButtons() {
+    exportButtons.innerHTML = "";
+    (info.export_formats || [])
+      .filter((f) => f.lossy)
+      .forEach((f) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "button secondary";
+        btn.dataset.format = f.name;
+        btn.dataset.available = f.available ? "1" : "0";
+        btn.textContent = f.label;
+        btn.title = f.available ? f.note : f.unavailable_reason || "Not available on this server.";
+        btn.addEventListener("click", () => downloadExport(f));
+        exportButtons.appendChild(btn);
+      });
+    updateExportButtons();
+  }
+
+  async function downloadExport(fmt) {
+    if (!currentJob || exporting) return;
+    exporting = true;
+    updateExportButtons();
+    showError("");
+    const short = fmt.label.split(" ·")[0];
+    setExportStatus(`Encoding ${short} from the protected file… a few seconds, longer on a small server.`);
+    try {
+      const res = await fetch(`${currentJob.download_url}?format=${encodeURIComponent(fmt.name)}`);
+      if (!res.ok) {
+        let detail = `Server returned ${res.status}.`;
+        try {
+          const payload = await res.json();
+          if (payload && payload.detail) detail = typeof payload.detail === "string" ? payload.detail : JSON.stringify(payload.detail);
+        } catch {
+          /* non-JSON error body */
+        }
+        throw new Error(detail);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${stemOf(currentJob.output_name)}${fmt.extension}`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      setExportStatus(`${short} ready (${fmtBytes(blob.size)}). Lossy: keep the ${currentJob.output_ext.slice(1).toUpperCase()} as your reference copy.`);
+    } catch (err) {
+      setExportStatus("");
+      showError(err && err.message ? err.message : `Could not export ${short}.`);
+    } finally {
+      exporting = false;
+      updateExportButtons();
+    }
+  }
+
   function renderStats(data) {
     const s = data.stats;
     const rows = [
@@ -127,6 +202,7 @@
       info.presets = [{ name: "light", label: "Light (default)", description: "Conservative default.", default: true }];
     }
     renderPresets();
+    renderExportButtons();
     const minutes = info.max_stereo_minutes_44k
       ? `~${info.max_stereo_minutes_44k} min stereo (${info.max_mono_minutes_44k} min mono)`
       : `${info.max_duration_minutes} min`;
@@ -180,8 +256,12 @@
         const detail = payload && payload.detail ? payload.detail : `Server returned ${res.status}.`;
         throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
       }
+      currentJob = payload;
       downloadLink.href = payload.download_url;
       downloadLink.download = payload.output_name;
+      downloadLink.textContent = `Download ${payload.output_ext.slice(1).toUpperCase()} (lossless, recommended)`;
+      setExportStatus("");
+      updateExportButtons();
       renderStats(payload);
       resultNote.textContent = payload.converted_to_lossless
         ? `Your ${payload.source_ext.slice(1).toUpperCase()} was decoded and returned as lossless ${payload.output_ext.slice(1).toUpperCase()} so the perturbation is not smoothed away by re-encoding. Download expires in ${payload.expires_in_minutes} minutes.`
