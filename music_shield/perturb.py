@@ -43,6 +43,7 @@ from dataclasses import dataclass, asdict
 import math
 
 import numpy as np
+import scipy.fft
 
 N_FFT = 2048
 HOP = N_FFT // 4
@@ -149,41 +150,105 @@ class ProtectStats:
         return asdict(self)
 
 
+# ---------------------------------------------------------------------------
+# Streaming STFT engine.
+#
+# The track is never turned into one big (frames x bins) matrix. The slow
+# random walks that drive the jitter / phase drift are planned for the whole
+# track up front (they are tiny: ~35 knots x frames), and each channel is then
+# processed CHUNK_FRAMES analysis frames at a time: frame -> rfft -> shape ->
+# irfft -> overlap-add straight into the float32 output array. Everything is
+# float32 / complex64. The peak working set of a job is therefore the input,
+# the output, and a few chunk-sized buffers, whatever the track length. The
+# only per-chunk state carried across chunk borders is the last
+# PRE_ECHO_FRAMES frames of the masking estimate.
+# ---------------------------------------------------------------------------
+
+# Analysis frames per chunk. 512 frames is ~6 s at 44.1 kHz and keeps the
+# per-chunk working set (complex64 spectrum, float32 power / mask / noise /
+# modulation buffers) around 20-40 MB. Fixed, not adaptive, so a given seed
+# always produces the same output.
+CHUNK_FRAMES = 512
+# Frames per block for the streaming input scan / statistics (~1 MB/channel).
+_STATS_BLOCK_FRAMES = 1 << 18
+_OVERLAP = N_FFT // HOP
+_ABSOLUTE_FLOOR_POWER = 10 ** (ABSOLUTE_FLOOR_DB / 10)
+
+
 def _hann(n: int) -> np.ndarray:
     return np.hanning(n + 1)[:-1].astype(np.float32)
 
 
-def _stft(x: np.ndarray) -> np.ndarray:
-    """Return an (n_bins, n_frames) complex STFT with a periodic Hann window."""
-    win = _hann(N_FFT)
-    pad = N_FFT
-    xp = np.pad(x, (pad, pad + N_FFT))
-    n_frames = 1 + (len(xp) - N_FFT) // HOP
-    idx = np.arange(N_FFT)[None, :] + HOP * np.arange(n_frames)[:, None]
-    frames = xp[idx] * win[None, :]
-    return np.fft.rfft(frames, axis=1).T
-
-
-def _istft(spec: np.ndarray, length: int) -> np.ndarray:
-    win = _hann(N_FFT)
-    frames = np.fft.irfft(spec.T, n=N_FFT, axis=1) * win[None, :]
-    n_frames = frames.shape[0]
-    out_len = N_FFT + HOP * (n_frames - 1)
-    out = np.zeros(out_len)
-    norm = np.zeros(out_len)
-    win_sq = win**2
-    for i in range(n_frames):
-        start = i * HOP
-        out[start : start + N_FFT] += frames[i]
-        norm[start : start + N_FFT] += win_sq
-    norm[norm < 1e-8] = 1.0
-    out /= norm
-    pad = N_FFT
-    return out[pad : pad + length]
+_WINDOW = _hann(N_FFT)
+# Periodic Hann at 75 % overlap: sum of the squared, shifted windows is the
+# constant 1.5 everywhere the signal is covered by all _OVERLAP frames, which
+# the N_FFT of zero padding on each side guarantees for every real sample.
+_OLA_NORM_PERIOD = (_WINDOW.astype(np.float64) ** 2).reshape(_OVERLAP, HOP).sum(axis=0)
+assert np.ptp(_OLA_NORM_PERIOD) < 1e-5, "window / hop pair is not constant-overlap-add"
+_OLA_NORM = float(_OLA_NORM_PERIOD.mean())
+_SYNTH_WINDOW = (_WINDOW / _OLA_NORM).astype(np.float32)
 
 
 def _n_frames_for(length: int) -> int:
-    return 1 + (length + 3 * N_FFT - N_FFT) // HOP
+    """Number of analysis frames for a signal padded by N_FFT before and 2*N_FFT after."""
+    return 1 + (length + 2 * N_FFT) // HOP
+
+
+def _frames_for_chunk(x: np.ndarray, f0: int, f1: int) -> np.ndarray:
+    """Windowed analysis frames f0..f1-1 of the virtually zero-padded signal.
+
+    Returns an (f1 - f0, N_FFT) float32 array. Only the slice of `x` that the
+    chunk touches is copied; the zero padding is materialised per chunk.
+    """
+    m = f1 - f0
+    start = f0 * HOP - N_FFT  # first sample needed, in x coordinates
+    span = (m - 1) * HOP + N_FFT
+    seg = np.zeros(span, dtype=np.float32)
+    a, b = max(start, 0), min(start + span, len(x))
+    if b > a:
+        seg[a - start : b - start] = x[a:b]
+    frames = np.lib.stride_tricks.sliding_window_view(seg, N_FFT)[::HOP]
+    return frames * _WINDOW
+
+
+def _stft_chunk(x: np.ndarray, f0: int, f1: int) -> np.ndarray:
+    """(f1 - f0, n_bins) complex64 spectrum of analysis frames f0..f1-1."""
+    return scipy.fft.rfft(_frames_for_chunk(x, f0, f1), axis=1)
+
+
+def _overlap_add_chunk(spec: np.ndarray, f0: int, out: np.ndarray) -> None:
+    """Inverse-transform a (m, n_bins) chunk and add it in place into `out` (1-D)."""
+    frames = scipy.fft.irfft(spec, n=N_FFT, axis=1)
+    frames *= _SYNTH_WINDOW
+    m = frames.shape[0]
+    span = (m - 1) * HOP + N_FFT
+    seg = np.zeros(span, dtype=np.float32)
+    # Frame i occupies seg[i*HOP : i*HOP + N_FFT]; split every frame into
+    # _OVERLAP hop-sized lanes so the overlap-add is _OVERLAP vector adds
+    # instead of a Python loop over frames.
+    lanes = frames.reshape(m, _OVERLAP, HOP)
+    for k in range(_OVERLAP):
+        seg[k * HOP : k * HOP + m * HOP] += lanes[:, k, :].reshape(-1)
+    start = f0 * HOP - N_FFT
+    a, b = max(start, 0), min(start + span, len(out))
+    if b > a:
+        out[a:b] += seg[a - start : b - start]
+
+
+def _stft(x: np.ndarray) -> np.ndarray:
+    """Full (n_bins, n_frames) complex64 STFT, assembled chunk by chunk.
+
+    Kept for the offline audibility proxies, which want the whole spectrogram;
+    `protect` itself never builds one.
+    """
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    n_frames = _n_frames_for(len(x))
+    n_bins = N_FFT // 2 + 1
+    spec = np.empty((n_frames, n_bins), dtype=np.complex64)
+    for f0 in range(0, n_frames, CHUNK_FRAMES):
+        f1 = min(f0 + CHUNK_FRAMES, n_frames)
+        spec[f0:f1] = _stft_chunk(x, f0, f1)
+    return spec.T
 
 
 def _band_edges(sample_rate: int, n_bins: int) -> np.ndarray:
@@ -204,35 +269,66 @@ def _bin_to_band(edges: np.ndarray, n_bins: int) -> np.ndarray:
     return band_of_bin
 
 
-def _masking_curve(power: np.ndarray, edges: np.ndarray, band_of_bin: np.ndarray, pre_echo_frames: int = PRE_ECHO_FRAMES) -> np.ndarray:
-    """Estimate a per-bin masking power from the signal's own band energies.
+def _masked_band_power(power: np.ndarray, edges: np.ndarray) -> np.ndarray:
+    """Per-frame masking power per band, before the pre-echo limit and floor.
 
-    Simplified model: mean band power, spread to neighbours (-18 dB upward, -27 dB downward), offset
-    by -20 dB, then floored at an absolute threshold. Returned as *power*.
-    `pre_echo_frames=0` gives the instantaneous estimate (used by the
-    audibility proxies); the default applies the synthesis-side pre-echo limit.
+    `power` is (frames, bins). Simplified model: mean band power, spread to
+    neighbours (-18 dB upward, -27 dB downward), offset by -20 dB.
     """
-    n_bins, n_frames = power.shape
-    band_power = np.zeros((NUM_BANDS, n_frames))
+    n_frames = power.shape[0]
+    band_power = np.zeros((n_frames, NUM_BANDS), dtype=np.float32)
     for b in range(NUM_BANDS):
         lo, hi = edges[b], edges[b + 1]
         if hi > lo:
-            band_power[b] = power[lo:hi].mean(axis=0)
+            band_power[:, b] = power[:, lo:hi].mean(axis=1)
     spread = band_power.copy()
     # Masking spreads upward in frequency more than downward.
-    spread[1:] = np.maximum(spread[1:], band_power[:-1] * 10 ** (NEIGHBOUR_SPREAD_UP_DB / 10))
-    spread[:-1] = np.maximum(spread[:-1], band_power[1:] * 10 ** (NEIGHBOUR_SPREAD_DOWN_DB / 10))
-    masked = spread * 10 ** (-20 / 10)
+    np.maximum(spread[:, 1:], band_power[:, :-1] * np.float32(10 ** (NEIGHBOUR_SPREAD_UP_DB / 10)), out=spread[:, 1:])
+    np.maximum(spread[:, :-1], band_power[:, 1:] * np.float32(10 ** (NEIGHBOUR_SPREAD_DOWN_DB / 10)), out=spread[:, :-1])
+    spread *= np.float32(10 ** (-20 / 10))
+    return spread
+
+
+def _pre_echo_limit(
+    masked: np.ndarray, prev_masked: np.ndarray | None, pre_echo_frames: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Backward running minimum over `pre_echo_frames` frames, then the absolute floor.
+
+    `prev_masked` holds the unlimited mask of the last frames of the previous
+    chunk so the running minimum sees across chunk borders exactly as it would
+    on the whole track. Returns (limited mask for this chunk, state for the
+    next chunk).
+    """
+    if prev_masked is not None and len(prev_masked):
+        stacked = np.concatenate([prev_masked, masked], axis=0)
+        skip = len(prev_masked)
+    else:
+        stacked, skip = masked, 0
     # Pre-echo control: a frame's noise is synthesised over its whole window,
     # so an attack near the end of the window would otherwise get noise
     # ~40 ms *before* it, in the quiet, where backward masking cannot hide it.
     # Limit each frame's mask by the earlier frames that overlap its span.
-    limited = masked.copy()
+    limited = stacked.copy()
     for k in range(1, pre_echo_frames + 1):
-        limited[:, k:] = np.minimum(limited[:, k:], masked[:, :-k])
-    floor = 10 ** (ABSOLUTE_FLOOR_DB / 10)
-    limited = np.maximum(limited, floor)
-    return limited[band_of_bin]
+        np.minimum(limited[k:], stacked[:-k], out=limited[k:])
+    limited = limited[skip:]
+    np.maximum(limited, np.float32(_ABSOLUTE_FLOOR_POWER), out=limited)
+    carry = stacked[len(stacked) - pre_echo_frames :] if pre_echo_frames else stacked[:0]
+    return limited, carry.copy()
+
+
+def _masking_curve(
+    power: np.ndarray, edges: np.ndarray, band_of_bin: np.ndarray, pre_echo_frames: int = PRE_ECHO_FRAMES
+) -> np.ndarray:
+    """Per-bin masking power for a whole (n_bins, n_frames) power spectrogram.
+
+    Whole-track convenience wrapper used by the audibility proxies; `protect`
+    runs the same model chunk by chunk. `pre_echo_frames=0` gives the
+    instantaneous estimate.
+    """
+    masked = _masked_band_power(np.ascontiguousarray(power.T, dtype=np.float32), edges)
+    limited, _ = _pre_echo_limit(masked, None, pre_echo_frames)
+    return limited[:, band_of_bin].T
 
 
 def _smooth_walk(rng: np.random.Generator, n_frames: int, smooth_frames: int, n_series: int) -> np.ndarray:
@@ -242,10 +338,13 @@ def _smooth_walk(rng: np.random.Generator, n_frames: int, smooth_frames: int, n_
     so the modulation has no fast, tremolo-like components.
     """
     width = max(2, 2 * smooth_frames)
-    raw = rng.standard_normal((n_series, n_frames + 2 * width))
-    kernel = np.hanning(width + 2)[1:-1]
+    # float32 throughout: the walks are (n_series, n_frames) for the whole
+    # track, the only whole-track arrays the engine keeps besides the audio.
+    raw = rng.standard_normal((n_series, n_frames + 2 * width), dtype=np.float32)
+    kernel = np.hanning(width + 2)[1:-1].astype(np.float32)
     kernel /= kernel.sum()
     smoothed = np.stack([np.convolve(r, kernel, mode="same") for r in raw])
+    del raw
     smoothed = smoothed[:, width : width + n_frames]
     std = smoothed.std(axis=1, keepdims=True)
     std[std < 1e-9] = 1.0
@@ -285,84 +384,177 @@ def _knot_interpolation(sample_rate: int, n_bins: int) -> tuple[np.ndarray, np.n
     return lo, lo + 1, w, len(knots)
 
 
-def _modulation(rng: np.random.Generator, sample_rate: int, n_bins: int, n_frames: int, preset: Preset) -> np.ndarray:
-    """Complex per-bin, per-frame multiplier combining gain jitter and phase drift.
+@dataclass
+class _ModulationPlan:
+    """Whole-track jitter / phase-drift walks at the knots, expanded per chunk.
 
     Shared by all channels of a file so that the stereo image is not modulated.
+    The per-knot walks are (n_knots, n_frames) and tiny; the per-bin complex
+    multiplier is only ever built for one chunk of frames at a time.
     """
+
+    gain_db: np.ndarray  # (n_knots, n_frames) float32
+    phase_rad: np.ndarray  # (n_knots, n_frames) float32
+    lo: np.ndarray  # (n_bins,) lower knot per bin
+    hi: np.ndarray  # (n_bins,) upper knot per bin
+    w: np.ndarray  # (n_bins,) float32 weight of the upper knot
+    fade: np.ndarray  # (n_bins,) float32 phase fade-in below PHASE_FADE_HI_HZ
+
+    @property
+    def n_frames(self) -> int:
+        return self.gain_db.shape[1]
+
+    def chunk(self, f0: int, f1: int) -> np.ndarray:
+        """(f1 - f0, n_bins) complex64 multiplier for frames f0..f1-1."""
+        one_minus_w = np.float32(1.0) - self.w
+        g = self.gain_db[:, f0:f1].T
+        gain_db_bins = g[:, self.lo] * one_minus_w + g[:, self.hi] * self.w
+        p = self.phase_rad[:, f0:f1].T
+        phase_bins = (p[:, self.lo] * one_minus_w + p[:, self.hi] * self.w) * self.fade
+        mag = np.float32(10) ** (gain_db_bins / np.float32(20))
+        mod = np.empty(gain_db_bins.shape, dtype=np.complex64)
+        mod.real = mag * np.cos(phase_bins)
+        mod.imag = mag * np.sin(phase_bins)
+        return mod
+
+
+def _plan_modulation(rng: np.random.Generator, sample_rate: int, n_bins: int, n_frames: int, preset: Preset) -> _ModulationPlan:
     lo, hi, w, n_knots = _knot_interpolation(sample_rate, n_bins)
     frames_per_s = sample_rate / HOP
     smooth_frames = max(1, int(preset.jitter_smooth_s * frames_per_s))
 
     gain_walk = _smooth_walk(rng, n_frames, smooth_frames, n_knots)
     gain_db = np.clip(gain_walk * (preset.jitter_db / 2.0), -preset.jitter_db, preset.jitter_db)
-    gain_db_bins = gain_db[lo] * (1.0 - w)[:, None] + gain_db[hi] * w[:, None]
 
     phase_walk = _smooth_walk(rng, n_frames, smooth_frames, n_knots)
     phase_deg = np.clip(phase_walk * (preset.phase_deg / 2.0), -preset.phase_deg, preset.phase_deg)
-    phase_bins = np.deg2rad(phase_deg[lo] * (1.0 - w)[:, None] + phase_deg[hi] * w[:, None])
     bin_hz = np.arange(n_bins) * (sample_rate / 2.0) / (n_bins - 1)
     fade = np.clip((bin_hz - PHASE_FADE_LO_HZ) / (PHASE_FADE_HI_HZ - PHASE_FADE_LO_HZ), 0.0, 1.0)
     fade[0] = 0.0
     fade[-1] = 0.0
-    phase_bins *= fade[:, None]
+    return _ModulationPlan(
+        gain_db=gain_db.astype(np.float32, copy=False),
+        phase_rad=np.deg2rad(phase_deg).astype(np.float32, copy=False),
+        lo=lo,
+        hi=hi,
+        w=w.astype(np.float32),
+        fade=fade.astype(np.float32),
+    )
 
-    return 10 ** (gain_db_bins / 20) * np.exp(1j * phase_bins)
+
+def _add_random_phase_noise(spec: np.ndarray, noise_power: np.ndarray, rng: np.random.Generator) -> None:
+    """Add noise of the given per-bin power with uniformly random phase, in place."""
+    phase = rng.uniform(0, 2 * math.pi, size=noise_power.shape).astype(np.float32, copy=False)
+    amp = np.sqrt(noise_power)
+    spec.real += amp * np.cos(phase)
+    spec.imag += amp * np.sin(phase)
 
 
 def _perturb_channel(
-    x: np.ndarray, sample_rate: int, preset: Preset, rng: np.random.Generator, modulation: np.ndarray
-) -> tuple[np.ndarray, bool]:
-    n = len(x)
-    spec = _stft(x)
-    n_bins, n_frames = spec.shape
-    power = np.abs(spec) ** 2
+    x: np.ndarray, out: np.ndarray, sample_rate: int, preset: Preset, rng: np.random.Generator, plan: _ModulationPlan
+) -> bool:
+    """Protect one channel, chunk by chunk, overlap-adding into `out` (zeroed, same length).
+
+    Returns whether the >15 kHz component was applied anywhere.
+    """
+    n_bins = N_FFT // 2 + 1
     edges = _band_edges(sample_rate, n_bins)
     band_of_bin = _bin_to_band(edges, n_bins)
-
-    # 1 + 2. Spectral jitter and phase drift (multiplicative, shared across channels).
-    spec_mod = spec * modulation
-
-    # 3. Masked noise, shaped under the estimated masking curve.
-    mask_power = _masking_curve(power, edges, band_of_bin)
-    noise_power = mask_power * 10 ** (preset.noise_offset_db / 10)
-    # Never inject noise into bins where the track itself is essentially silent
-    # (digital silence at intro/outro should stay silent).
-    silent = power < 10 ** (ABSOLUTE_FLOOR_DB / 10)
-    noise_power[silent] = 0.0
-    phase = rng.uniform(0, 2 * math.pi, size=spec.shape)
-    # Mask and noise are both in STFT units, so no window scaling is needed.
-    noise_spec = np.sqrt(noise_power) * np.exp(1j * phase)
-
-    y = _istft(spec_mod + noise_spec, n)
-
-    # 4. High-band component: extra masked noise above 15 kHz, at a smaller
-    # offset under the same masking estimate (hearing is poor up there). It
-    # used to be RMS-calibrated and ignored the mask, which put energy into
-    # empty air bands on sparse material; shaping it under the mask means the
-    # whole additive part of the perturbation sits under the mask estimate by
-    # construction, and a track with nothing above 15 kHz gets nothing added.
-    hf_applied = False
+    noise_gain = np.float32(10 ** (preset.noise_offset_db / 10))
+    hf_gain = np.float32(10 ** (preset.hf_offset_db / 10))
     hf_start_bin = int(HF_BAND_START_HZ / (sample_rate / 2.0) * (n_bins - 1))
-    if hf_start_bin < n_bins - 4:
-        hf_power = mask_power[hf_start_bin:] * 10 ** (preset.hf_offset_db / 10)
-        hf_power[silent[hf_start_bin:]] = 0.0
-        # Only bins whose own content is above the absolute floor got noise,
-        # so the mask floor alone never creates a high band from nothing.
-        if hf_power.any():
-            hf_applied = True
-            hf_phase = rng.uniform(0, 2 * math.pi, size=hf_power.shape)
-            hf_spec = np.zeros_like(spec)
-            hf_spec[hf_start_bin:] = np.sqrt(hf_power) * np.exp(1j * hf_phase)
-            y = y + _istft(hf_spec, n)
+    hf_possible = hf_start_bin < n_bins - 4
+    hf_applied = False
+    prev_masked: np.ndarray | None = None
 
-    return y, hf_applied
+    for f0 in range(0, plan.n_frames, CHUNK_FRAMES):
+        f1 = min(f0 + CHUNK_FRAMES, plan.n_frames)
+        spec = _stft_chunk(x, f0, f1)  # (m, n_bins) complex64
+        power = spec.real**2 + spec.imag**2
+        # Never inject noise into bins where the track itself is essentially
+        # silent (digital silence at intro/outro should stay silent).
+        silent = power < np.float32(_ABSOLUTE_FLOOR_POWER)
+        masked = _masked_band_power(power, edges)
+        del power
+        limited, prev_masked = _pre_echo_limit(masked, prev_masked, PRE_ECHO_FRAMES)
+        mask_power = limited[:, band_of_bin]  # (m, n_bins) float32
+
+        # 1 + 2. Spectral jitter and phase drift (multiplicative, shared across channels).
+        spec *= plan.chunk(f0, f1)
+
+        # 3. Masked noise, shaped under the estimated masking curve. Mask and
+        # noise are both in STFT units, so no window scaling is needed.
+        noise_power = mask_power * noise_gain
+        noise_power[silent] = 0.0
+        _add_random_phase_noise(spec, noise_power, rng)
+        del noise_power
+
+        # 4. High-band component: extra masked noise above 15 kHz, at a smaller
+        # offset under the same masking estimate (hearing is poor up there).
+        # Shaping it under the mask means the whole additive part of the
+        # perturbation sits under the mask estimate by construction, and a
+        # track with nothing above 15 kHz gets nothing added. Synthesis is
+        # linear, so it is summed into the same chunk spectrum.
+        if hf_possible:
+            hf_power = mask_power[:, hf_start_bin:] * hf_gain
+            hf_power[silent[:, hf_start_bin:]] = 0.0
+            # Only bins whose own content is above the absolute floor got noise,
+            # so the mask floor alone never creates a high band from nothing.
+            if hf_power.any():
+                hf_applied = True
+                _add_random_phase_noise(spec[:, hf_start_bin:], hf_power, rng)
+            del hf_power
+        del mask_power, silent
+
+        _overlap_add_chunk(spec, f0, out)
+        del spec
+    return hf_applied
+
+
+def _block_ranges(n: int):
+    for start in range(0, n, _STATS_BLOCK_FRAMES):
+        yield start, min(start + _STATS_BLOCK_FRAMES, n)
+
+
+def _scan_input(x: np.ndarray) -> tuple[bool, float, float]:
+    """(all finite, peak, energy) of a (samples, channels) array, in blocks."""
+    peak = 0.0
+    energy = 0.0
+    for a, b in _block_ranges(x.shape[0]):
+        blk = x[a:b]
+        if not np.isfinite(blk).all():
+            return False, peak, energy
+        if blk.size:
+            peak = max(peak, float(blk.max()), float(-blk.min()))
+            blk64 = blk.astype(np.float64)
+            energy += float(np.einsum("ij,ij->", blk64, blk64))
+    return True, peak, energy
+
+
+def _peak(x: np.ndarray) -> float:
+    peak = 0.0
+    for a, b in _block_ranges(x.shape[0]):
+        blk = x[a:b]
+        if blk.size:
+            peak = max(peak, float(blk.max()), float(-blk.min()))
+    return peak
+
+
+def _diff_energy(x: np.ndarray, y: np.ndarray) -> float:
+    energy = 0.0
+    for a, b in _block_ranges(x.shape[0]):
+        d = y[a:b].astype(np.float64)
+        d -= x[a:b]
+        energy += float(np.einsum("ij,ij->", d, d))
+    return energy
 
 
 def protect(audio: np.ndarray, sample_rate: int, preset_name: str = DEFAULT_PRESET, seed: int | None = None) -> tuple[np.ndarray, ProtectStats]:
     """Apply the perturbation to a (samples, channels) float array in [-1, 1].
 
     Returns the protected audio (same shape, float32) and change statistics.
+    Peak memory is the input plus an output of the same size plus a few tens
+    of MB of chunk buffers, independent of track length (see LIMITS.md).
     """
     if preset_name not in PRESETS:
         raise ValueError(f"Unknown preset '{preset_name}'. Choose one of: {', '.join(PRESETS)}")
@@ -373,37 +565,36 @@ def protect(audio: np.ndarray, sample_rate: int, preset_name: str = DEFAULT_PRES
         raise ValueError("audio must have shape (samples,) or (samples, channels)")
     if audio.shape[0] < N_FFT:
         raise ValueError(f"Track is too short to process (need at least {N_FFT} samples).")
-    if not np.isfinite(audio).all():
-        raise ValueError("Input audio contains NaN or infinite samples.")
 
     x = np.ascontiguousarray(audio, dtype=np.float32)
+    finite, original_peak, sig_energy = _scan_input(x)
+    if not finite:
+        raise ValueError("Input audio contains NaN or infinite samples.")
+
     base_rng = np.random.default_rng(seed)
     modulation_seed = int(base_rng.integers(0, 2**63 - 1))
     channel_seeds = base_rng.integers(0, 2**63 - 1, size=x.shape[1])
 
     n_bins = N_FFT // 2 + 1
     n_frames = _n_frames_for(x.shape[0])
-    modulation = _modulation(np.random.default_rng(modulation_seed), sample_rate, n_bins, n_frames, preset)
+    plan = _plan_modulation(np.random.default_rng(modulation_seed), sample_rate, n_bins, n_frames, preset)
 
-    out = np.empty_like(x)
+    out = np.zeros_like(x)
     hf_any = False
     for ch in range(x.shape[1]):
         rng = np.random.default_rng(int(channel_seeds[ch]))
-        out[:, ch], hf = _perturb_channel(x[:, ch], sample_rate, preset, rng, modulation)
+        hf = _perturb_channel(x[:, ch], out[:, ch], sample_rate, preset, rng, plan)
         hf_any = hf_any or hf
 
-    original_peak = float(np.abs(x).max()) if x.size else 0.0
-    peak = float(np.abs(out).max()) if out.size else 0.0
+    peak = _peak(out)
     peak_limited = False
     if peak > PEAK_CEILING:
         # Scale the whole file rather than hard-clipping individual samples.
-        out *= PEAK_CEILING / peak
+        out *= np.float32(PEAK_CEILING / peak)
         peak_limited = True
-        peak = float(np.abs(out).max())
+        peak = _peak(out)
 
-    diff = out - x
-    sig_energy = float(np.sum(x**2))
-    diff_energy = float(np.sum(diff**2))
+    diff_energy = _diff_energy(x, out)
     if diff_energy <= 0:
         snr_db = float("inf")
     elif sig_energy <= 0:
