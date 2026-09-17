@@ -99,6 +99,33 @@ def test_demo_clip_is_valid_wav_and_protects(client):
     assert body["stats"]["snr_db"] > 20
 
 
+def test_info_reports_memory_guard(client):
+    data = client.get("/api/info").json()
+    assert data["max_sample_frames"] > 0
+    assert 0 < data["max_stereo_minutes_44k"] <= data["max_duration_minutes"]
+    assert data["max_stereo_minutes_44k"] <= data["max_mono_minutes_44k"] <= data["max_duration_minutes"]
+
+
+def test_track_over_memory_budget_is_rejected_with_413_before_decoding(client, monkeypatch):
+    """A file the memory model cannot afford gets a clean 413, not an OOM-killed worker.
+
+    The guard runs on the header (libsndfile info / ffprobe), so a WAV whose
+    *declared* frame count is over budget is rejected without reading samples.
+    """
+    import music_shield.audio_io as audio_io
+
+    # Budget for a 1 s stereo clip at 22.05 kHz: a 2 s clip is over.
+    monkeypatch.setattr(audio_io, "MAX_SAMPLE_FRAMES", 22050 * 2)
+    ok = client.post("/api/protect", files={"file": ("short.wav", _wav_bytes(1.0), "audio/wav")})
+    assert ok.status_code == 200, ok.text
+    res = client.post("/api/protect", files={"file": ("long.wav", _wav_bytes(2.0), "audio/wav")})
+    assert res.status_code == 413, res.text
+    detail = res.json()["detail"]
+    assert "memory budget" in detail
+    # The limit is quoted for this file's own rate / layout.
+    assert "stereo" in detail and "22050 Hz" in detail and "1 second" in detail
+
+
 def test_index_served(client):
     res = client.get("/")
     assert res.status_code == 200

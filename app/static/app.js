@@ -26,7 +26,7 @@
 
   let selectedFile = null;
   let isDemo = false;
-  let info = { accepted_extensions: [".wav", ".flac"], presets: [], max_upload_mb: 80, max_duration_minutes: 15 };
+  let info = { accepted_extensions: [".wav", ".flac"], presets: [], max_upload_mb: 80, max_duration_minutes: 15, max_stereo_minutes_44k: null };
   let originalUrl = null;
   let busy = false;
 
@@ -127,7 +127,10 @@
       info.presets = [{ name: "light", label: "Light (default)", description: "Conservative default.", default: true }];
     }
     renderPresets();
-    limitsInline.textContent = `up to ${info.max_upload_mb} MB / ${info.max_duration_minutes} min`;
+    const minutes = info.max_stereo_minutes_44k
+      ? `~${info.max_stereo_minutes_44k} min stereo (${info.max_mono_minutes_44k} min mono)`
+      : `${info.max_duration_minutes} min`;
+    limitsInline.textContent = `up to ${info.max_upload_mb} MB / ${minutes}`;
   }
 
   async function loadDemo() {

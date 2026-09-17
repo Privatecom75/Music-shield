@@ -15,8 +15,14 @@ paste it into an issue, commit message, or this file.
 - Writable scratch space for `MUSIC_SHIELD_DATA_DIR` (defaults to the system
   temp dir). Everything in it is disposable and expires after an hour.
 - Enough CPU to run an STFT over a full track in one request. It is
-  single-threaded numpy; a 5-minute stereo 44.1 kHz file takes ~2–4 s on a
-  laptop core.
+  single-threaded numpy/scipy; a 5-minute stereo 44.1 kHz file takes ~3 s on
+  a laptop core.
+- RAM: the STFT is streamed in fixed-size chunks, so a job needs roughly
+  8 bytes per sample per channel (float32 in + float32 out) on top of a
+  ~150–180 MB warm baseline. `MUSIC_SHIELD_MEMORY_BUDGET_MB` (default `512`)
+  tells the size guard how much the host has; files that would not fit get
+  a 413 before decoding. Set it to the instance's real RAM. See LIMITS.md
+  "Operational limits" for what that means in minutes.
 - Listens on `$PORT` (Docker image) — every platform below sets that.
 
 ## Render (free web service)
@@ -29,12 +35,17 @@ paste it into an issue, commit message, or this file.
   disposable anyway), and free CPU is slow, so long tracks may hit Render's
   request timeout. Set `MUSIC_SHIELD_MAX_UPLOAD_MB` lower (e.g. `30`) if that
   bites.
+- The free instance has 512 MB RAM, which is the default
+  `MUSIC_SHIELD_MEMORY_BUDGET_MB`; leave it unless you move to a bigger
+  instance. Tracks the budget cannot afford are rejected with a 413 up front
+  (about 6.3 min stereo / 12.7 min mono at 44.1 kHz).
 - Set `MUSIC_SHIELD_BASIC_USER` + `MUSIC_SHIELD_BASIC_PASSWORD` (app enforces HTTP Basic).
 
 ## Fly.io
 
 - `fly launch` will detect the Dockerfile. Choose a `shared-cpu-1x` machine
-  with 256–512 MB RAM (numpy on a long 48 kHz file can exceed 256 MB — use 512).
+  with 512 MB RAM. 256 MB is not enough: that is the fixed overhead the size
+  guard assumes, so nothing useful would fit in the remaining budget.
 - Set `internal_port = 8420` in `fly.toml` or set `PORT` to match.
 - Fly's free allowance has been reduced/changed several times; check current
   pricing. Scale to zero (`min_machines_running = 0`) keeps the bill near zero
