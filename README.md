@@ -60,7 +60,7 @@ See [Roadmap](#roadmap-not-promises).
 ## Run locally
 
 Requirements: Python 3.10+, and `ffmpeg` on your PATH if you want MP3 input
-(WAV and FLAC work without it).
+or the optional MP3/MP4 exports (WAV and FLAC in and out work without it).
 
 ```sh
 ./run.sh
@@ -87,6 +87,26 @@ Open the URL, drop a WAV/FLAC/MP3, tick the ownership box, click **Protect
 track**, download the result. MP3 input comes back as WAV because re-encoding
 to a lossy codec would partly smooth away the perturbation.
 
+### Optional MP3 / MP4 export
+
+After protecting, the result panel offers **WAV/FLAC (default, lossless)**,
+**MP3** and **MP4 video**. The lossy ones are made with ffmpeg from the
+stored lossless file, on first request, and cached until the job expires:
+
+| Format | What you get | ffmpeg settings |
+| --- | --- | --- |
+| `wav` / `flac` | The protected file as written. Default. | none |
+| `mp3` | Protected audio, lossy | `libmp3lame -b:a 192k` |
+| `mp4` | Protected audio under a generated still cover (gradient, waveform bars, title text when a font is installed), lossy | `-loop 1` PNG → `libx264 -tune stillimage -preset ultrafast -crf 18 -pix_fmt yuv420p` at 2 fps, 1280×720; `aac -b:a 192k`; `-movflags +faststart` |
+
+**Lossy export weakens the perturbation.** A 192 kbps re-encode removes the
+>15 kHz component, buries the masked noise under codec noise, and adds codec
+error larger than the whole perturbation; uploading the MP4 to a video
+platform re-encodes it again. Keep the WAV/FLAC as the copy you rely on and
+treat MP3/MP4 as convenience copies for distribution. Details in
+[LIMITS.md](LIMITS.md) "Lossy exports". Formats whose encoder is missing from
+the server's ffmpeg are shown disabled and answer HTTP 501.
+
 No track handy? Click **Try demo clip** to load a 5-second synthetic chord
 generated on the server (`GET /api/demo-clip`) and run it through the same
 pipeline and presets.
@@ -100,6 +120,7 @@ pipeline and presets.
 | `MUSIC_SHIELD_JOB_TTL_S` | `3600` | Seconds before a protected file is deleted |
 | `MUSIC_SHIELD_MAX_UPLOAD_MB` | `80` | Upload size limit |
 | `MUSIC_SHIELD_MEMORY_BUDGET_MB` | `512` | RAM the host has; sizes the guard that rejects tracks too big to protect in memory |
+| `MUSIC_SHIELD_COVER_FONT` | auto (DejaVu / Liberation / Arial if found) | TTF used for the title on the MP4 cover; no font means no text, the video is still produced |
 
 Tracks longer than 15 minutes are rejected, and so are tracks that would not
 fit the memory budget — about 6.3 minutes of stereo or 12.7 minutes of mono
@@ -159,15 +180,27 @@ track that has none, and that no noise precedes an attack from silence.
 `tests/test_ai_eval.py` asserts the change survives the denoise and resample
 chains (EnCodec test skipped without torch/encodec). Floors are listed in
 [METRICS.md](METRICS.md).
+`tests/test_export.py` covers the `format` query (lossless default, FLAC
+stays FLAC, unknown values are 400, missing ffmpeg is 501), asserts with a
+mocked ffmpeg that MP3 uses `libmp3lame -b:a 192k` and MP4 uses a looped
+still image with `libx264 -tune stillimage`, `aac -b:a 192k`, `+faststart`,
+that exports are encoded once and cached, and — when ffmpeg with the encoders
+is present — probes the real MP3 and MP4 outputs.
 
 ## API
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| `GET` | `/api/info` | Presets, accepted extensions, limits, demo clip metadata |
+| `GET` | `/api/info` | Presets, accepted extensions, limits, demo clip metadata, `export_formats` (name, label, lossy, bitrate, available) |
 | `GET` | `/api/demo-clip` | 5-second synthetic stereo WAV for trying the tool |
-| `POST` | `/api/protect` | multipart `file` + optional `strength`; returns JSON with `download_url` and `stats` |
-| `GET` | `/api/download/{job_id}` | The protected file (`audio/wav` or `audio/flac`) |
+| `POST` | `/api/protect` | multipart `file` + optional `strength`; returns JSON with `download_url`, `export_urls` and `stats` |
+| `GET` | `/api/download/{job_id}` | The protected file, lossless (`audio/wav` or `audio/flac`) by default |
+| `GET` | `/api/download/{job_id}?format=mp3` | Lossy MP3 (192 kbps) encoded from the stored lossless file; 501 if ffmpeg lacks `libmp3lame` |
+| `GET` | `/api/download/{job_id}?format=mp4` | Lossy MP4 video (H.264 still cover + AAC 192 kbps); 501 if ffmpeg lacks `libx264`/`aac` |
+
+`format` accepts `wav`, `flac`, `mp3`, `mp4`; anything else is a 400. `wav`
+and `flac` must match the job's lossless output (no lossless-to-lossless
+transcoding).
 | `GET` | `/api/health` | Liveness |
 
 Authentication: when `MUSIC_SHIELD_BASIC_PASSWORD` is set (optionally with
@@ -180,7 +213,8 @@ single shared credential. Unset, the app is open, which is only acceptable on
 ```
 music_shield/      engine (perturb.py), codec round-trip metrics (codec_eval.py),
                    audibility proxies (audibility.py), copy-friction pipelines
-                   (ai_eval.py), audio I/O, synthetic signals, CLI
+                   (ai_eval.py), audio I/O, lossy MP3/MP4 export (export.py),
+                   synthetic signals, CLI
 app/main.py        FastAPI server
 app/static/        plain HTML / CSS / JS front end
 tests/             pytest suite

@@ -1,8 +1,10 @@
 FROM python:3.12-slim
 
-# ffmpeg is only needed for MP3 input; libsndfile handles WAV/FLAC.
+# ffmpeg: MP3 input and the optional MP3 / MP4-video exports (libmp3lame,
+# libx264, aac). fonts-dejavu-core: title text on the MP4 cover; without a
+# font the video is still produced, just without text. libsndfile: WAV/FLAC.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg libsndfile1 \
+ && apt-get install -y --no-install-recommends ffmpeg libsndfile1 fonts-dejavu-core \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /srv

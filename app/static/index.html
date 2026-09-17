@@ -72,7 +72,16 @@
       <div class="result" id="result" hidden>
         <h2>Protected file ready</h2>
         <p class="muted" id="result-note"></p>
-        <a id="download-link" class="primary button" download>Download protected file</a>
+        <div class="formats" role="group" aria-label="Download format">
+          <a id="download-link" class="primary button" download>Download WAV</a>
+          <div id="export-buttons" class="export-buttons"></div>
+        </div>
+        <p class="status tiny" id="export-status" role="status" aria-live="polite"></p>
+        <p class="tiny format-note" id="format-note">
+          <strong>WAV/FLAC keeps the most friction.</strong> MP3 and MP4 re-encode the audio with a lossy codec, which
+          removes or weakens part of the perturbation (and platforms that re-encode again weaken it further).
+          Use them for convenience and distribution; keep the lossless file as the copy you rely on.
+        </p>
         <dl class="stats" id="stats"></dl>
         <p class="tiny muted">
           These numbers describe <em>how much the file changed</em>. They are not a measure of how well the file
@@ -100,7 +109,7 @@
           <li>Adds pseudo-random noise shaped under a simple masking curve, so it hides behind the music instead of sounding like flat hiss.</li>
           <li>Adds a little extra masked noise above 15&nbsp;kHz, only where the track already has content up there; codecs remove this one, so nothing relies on it.</li>
           <li>Runs entirely on this server with free, open tooling. No accounts, no uploads to third parties, originals are deleted after processing.</li>
-          <li>Returns a lossless WAV or FLAC so the perturbation is not smoothed away by re-encoding.</li>
+          <li>Returns a lossless WAV or FLAC by default so the perturbation is not smoothed away by re-encoding. Optional MP3 and MP4-video exports exist for convenience; they are lossy and carry less of the perturbation.</li>
         </ul>
       </div>
       <div class="card soft warn" id="limits">

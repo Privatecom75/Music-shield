@@ -11,7 +11,11 @@ paste it into an issue, commit message, or this file.
 ## What the app needs
 
 - Python 3.10+ (or the Dockerfile), `libsndfile` (bundled with the
-  `soundfile` wheel on most platforms), and optionally `ffmpeg` for MP3 input.
+  `soundfile` wheel on most platforms), and optionally `ffmpeg` for MP3 input
+  and the MP3 / MP4-video exports (needs `libmp3lame`, `libx264`, `aac`;
+  Debian's `ffmpeg` package has all three). A TTF font (`fonts-dejavu-core`
+  in the Dockerfile) puts the title on the MP4 cover; without one the video
+  is produced with no text.
 - Writable scratch space for `MUSIC_SHIELD_DATA_DIR` (defaults to the system
   temp dir). Everything in it is disposable and expires after an hour.
 - Enough CPU to run an STFT over a full track in one request. It is
@@ -22,7 +26,9 @@ paste it into an issue, commit message, or this file.
   ~150–180 MB warm baseline. `MUSIC_SHIELD_MEMORY_BUDGET_MB` (default `512`)
   tells the size guard how much the host has; files that would not fit get
   a 413 before decoding. Set it to the instance's real RAM. See LIMITS.md
-  "Operational limits" for what that means in minutes.
+  "Operational limits" for what that means in minutes. MP3/MP4 exports run
+  as a separate ffmpeg process (~55 MiB / ~100 MiB peak) behind the same
+  one-job-at-a-time lock, so they add nothing to the protect job's peak.
 - Listens on `$PORT` (Docker image) — every platform below sets that.
 
 ## Render (free web service)

@@ -37,6 +37,7 @@ it adds friction, and friction can be removed.
 | --- | --- |
 | Lossy re-encoding (MP3, AAC) at 128–192 kbps | **Improved, with a hard ceiling.** The jitter and phase-drift components are multiplicative on the track's own content, which codecs reproduce accurately, so 93–99 % of that change is still in the decoded file (least-squares retained fraction, synthetic clips, MP3 128k/192k and AAC 128k). Masked noise is nominally retained but buried under codec noise about 17 dB louder; the >15 kHz component is low-passed away (12 % retained at MP3 128k) and is no longer counted on. The ceiling: at 128 kbps the codec's *own* error (≈ -23 dB on a dense mix) is louder than the whole `light` perturbation (≈ -29 dB). An inaudible perturbation cannot out-shout a codec whose design goal is to be just inaudible; what we changed is that ours now persists through the codec rather than being replaced by it. Numbers in [METRICS.md](METRICS.md). |
 | Lossy re-encoding at low bitrates (≤ 96 kbps MP3/AAC, Opus/Ogg at speech-ish rates) | Not measured. Expect the codec error to grow well past the perturbation and the retained fraction to fall. Do not assume the 128k numbers hold. |
+| **Our own MP3 / MP4 export** (`?format=mp3`, `?format=mp4`) | Exactly the row above, applied by us: the export re-encodes the protected file with libmp3lame or AAC at 192 kbps, so it inherits every weakness of a lossy re-encode — the >15 kHz component is gone, the masked noise is buried under codec noise, and the codec's own error is larger than the whole perturbation. Distributing the MP4 through a video platform re-encodes it *again*. The lossless download exists because of this; see "Lossy exports" below. |
 | Downsampling to 16 kHz | **Measured.** 100 % of the change is retained (it lives below 8 kHz); the resampler removes the >15 kHz component and everything else up there, which is why nothing relies on it. |
 | Denoising (ffmpeg `afftdn` after MP3 128k) | **Measured.** 94–96 % of the change retained: an FFT denoiser subtracts an estimated noise floor, and a multiplicative gain/phase wobble is not a noise floor. But the denoiser's own damage (log-mel 1.8–5.2 dB) is far larger than ours, so the cleaned protected copy is only 0.03–0.09 dB further from the master than a cleaned unprotected copy at `light`. |
 | Neural codec re-synthesis (EnCodec 24 kHz, 6–24 kbps) | **Measured.** 91–103 % of the change retained, but buried: the codec's own reconstruction error (-13 to -18 dB) is 10–15 dB louder than the whole `light` perturbation, and `light` moves the codec's tokens/latents less than an MP3 does. Source separation and re-synthesis models proper were not measured; expect them to discard the change along with everything else they do not model. An adaptive attacker who knows our masking model can target it directly. |
@@ -112,6 +113,36 @@ component contribute almost nothing to magnitude features after a re-encode.
   to the MP3, but the MP3 itself already lost information relative to your
   master; protecting a master is always better than protecting an MP3.
 
+## Lossy exports (MP3 and MP4 video)
+
+The default download is, and stays, the lossless WAV (or FLAC when the upload
+was FLAC). On request the server will also hand back the same protected audio
+as an **MP3** (libmp3lame, 192 kbps) or as an **MP4 video** (H.264 still
+cover — soft gradient, waveform bars, title text — with AAC audio at
+192 kbps). Both are made with ffmpeg from the stored lossless file; the track
+is never re-protected and never re-decoded into Python.
+
+Be clear about what you are getting:
+
+- **Lossy export weakens the perturbation.** It is a lossy re-encode, the
+  first row of the attack table, done for you. At 192 kbps the multiplicative
+  jitter/phase components mostly persist (93–99 % retained on synthetic
+  clips, METRICS.md), but the >15 kHz component is removed, the masked noise
+  is buried ~17 dB under codec noise, and the codec's own error is louder
+  than everything we added. The net result is less friction than the
+  lossless file, and we have not measured the MP4/AAC path separately from
+  the AAC row in METRICS.md.
+- **Video platforms re-encode again.** Uploading the MP4 to YouTube or a
+  social network transcodes the audio a second time, usually to a lower AAC
+  or Opus rate. Expect the low-bitrate row of the table: unmeasured, and
+  worse.
+- **The video is decorative.** It carries no watermark, no verification, no
+  additional protection. It exists so the protected audio can go where a
+  video is required.
+- **Use WAV/FLAC for the copy you rely on.** MP3/MP4 are for convenience and
+  distribution. If you need both, keep the lossless file as your reference
+  and treat the lossy ones as derived copies.
+
 ## Operational limits
 
 - Tracks over 15 minutes and uploads over 80 MB are rejected (configurable).
@@ -133,6 +164,16 @@ component contribute almost nothing to magnitude features after a re-encode.
   waits for the first to finish (the memory guard budgets for a single job).
   A 6-minute stereo 44.1 kHz WAV takes ~3 s on a laptop core and considerably
   longer on a free-tier container.
+- MP3/MP4 exports take the same one-at-a-time lock, so an export never runs
+  next to a protect job at its memory peak. ffmpeg reads the stored lossless
+  file from disk itself; the Python process holds nothing but the ~10 MB
+  cover image while it is rendered. Measured on a 200 s stereo 44.1 kHz file:
+  ffmpeg peaks at ~55 MiB for MP3 (2 s on a laptop core) and ~100 MiB for
+  MP4 (720p still at 2 fps, x264 `ultrafast`, one thread; ~5 s). Exports are
+  encoded on first request, cached next to the lossless file, and deleted
+  with the job. If the server's ffmpeg lacks `libmp3lame`, `libx264` or
+  `aac`, the format is reported as unavailable in `/api/info` and the
+  download answers 501; the lossless download is unaffected.
 - Protected files are kept for one hour then deleted. Originals are deleted as
   soon as processing finishes. There is no account, so there is no way to
   recover a file after it expires.
