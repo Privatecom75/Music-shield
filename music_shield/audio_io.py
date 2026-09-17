@@ -78,10 +78,15 @@ def _check_size(frames: int, channels: int) -> None:
 
 
 def _ffprobe_stream(path: Path) -> tuple[int, int, int]:
-    """Return (sample_rate, channels, approx_frames) via ffprobe. frames may be 0 if unknown."""
+    """Return (sample_rate, channels, approx_frames) via ffprobe. frames may be 0 if unknown.
+
+    Do NOT use stream duration_ts alone as frames: on MP3 it is in the stream
+    time_base (often 1/14112000), not sample ticks — that falsely rejects short clips.
+    """
     cmd = [
         "ffprobe", "-v", "error", "-select_streams", "a:0",
-        "-show_entries", "stream=sample_rate,channels,duration_ts,duration",
+        "-show_entries", "stream=sample_rate,channels,duration",
+        "-show_entries", "format=duration",
         "-of", "json", str(path),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
@@ -94,11 +99,8 @@ def _ffprobe_stream(path: Path) -> tuple[int, int, int]:
     s = streams[0]
     sr = int(float(s.get("sample_rate") or 0))
     ch = int(s.get("channels") or 0)
-    frames = 0
-    if s.get("duration_ts"):
-        frames = int(s["duration_ts"])
-    elif s.get("duration") and sr:
-        frames = int(float(s["duration"]) * sr)
+    dur = s.get("duration") or (info.get("format") or {}).get("duration")
+    frames = int(float(dur) * sr) if dur and sr else 0
     if sr <= 0 or ch <= 0:
         raise UnsupportedFormatError("Could not read sample rate/channels from this MP3.")
     return sr, ch, frames
